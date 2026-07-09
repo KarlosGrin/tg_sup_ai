@@ -663,9 +663,17 @@ async def _send_result_file(message: Message, user_id: int, output_path: str, ex
     if output_path_obj.exists():
         found_file = output_path_obj
     else:
-        # ⚠️ Больше НЕ ищем «любой недавний файл» — это приводило бы к утечке данных
-        # между пользователями. Если файла нет — просто сообщаем об этом.
-        found_file = None
+        # Ищем в ПАПКЕ ПОЛЬЗОВАТЕЛЯ (не跨-user) файлы младше 10 секунд
+        user_processed = Path(config.PROCESSED_DIR) / str(user_id)
+        if user_processed.exists():
+            recent = sorted(
+                [f for f in user_processed.iterdir() if f.is_file() and now - f.stat().st_mtime < 10],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            found_file = recent[0] if recent else None
+        else:
+            found_file = None
 
     if found_file:
         file_service.save_processed(found_file, user_id)

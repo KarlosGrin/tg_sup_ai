@@ -1,12 +1,13 @@
 """
 Безопасный исполнитель Python-кода.
-Выполняет код в ОТДЕЛЬНОМ ПРОЦЕССЕ с ограниченными builtins и без доступа к os и подпроцессам.
+Выполняет код в ОТДЕЛЬНОМ ПРОЦЕССЕ (subprocess) с ограниченными builtins
+и без доступа к os, subprocess, сети и файловой системе вне разрешённых папок.
 """
 
-import multiprocessing
+import json
+import subprocess
 import sys
-import traceback
-from io import StringIO
+import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -14,204 +15,146 @@ import pandas as pd
 
 
 # ══════════════════════════════════════════════════════════════════
-# Ограниченный набор builtins — ничего опасного
+# Sandbox-обёртка — запускается в отдельном процессе через subprocess
 # ══════════════════════════════════════════════════════════════════
-# Умышленно удалены: exec, eval, compile, __import__, input,
-# globals, locals, vars, dir, open (заменяем своим), breakpoint, help
-# ══════════════════════════════════════════════════════════════════
-_SAFE_BUILTINS: dict[str, object] = {
-    # Константы
-    "True": True, "False": False, "None": None,
-    "Ellipsis": Ellipsis, "NotImplemented": NotImplemented,
-    # Фабрики типов
-    "bool": bool, "int": int, "float": float, "complex": complex,
-    "str": str, "bytes": bytes, "bytearray": bytearray,
-    "list": list, "dict": dict, "tuple": tuple, "set": set, "frozenset": frozenset,
-    "object": object, "type": type, "slice": slice,
-    # Итерация / последовательности
-    "range": range, "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
-    "reversed": reversed, "sorted": sorted, "iter": iter, "next": next,
-    "len": len, "min": min, "max": max, "sum": sum, "any": any, "all": all,
-    # Математика / строки
-    "abs": abs, "round": round, "pow": pow, "divmod": divmod,
-    "ord": ord, "chr": chr, "repr": repr, "ascii": ascii, "format": format,
-    "hash": hash, "id": id, "isinstance": isinstance, "issubclass": issubclass,
-    "hasattr": hasattr, "getattr": getattr, "setattr": setattr, "delattr": delattr,
-    "callable": callable, "staticmethod": staticmethod, "classmethod": classmethod,
-    "property": property, "super": super,
-    "print": print,
-    # Исключения
-    "Exception": Exception, "BaseException": BaseException,
-    "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
-    "IndexError": IndexError, "AttributeError": AttributeError,
-    "StopIteration": StopIteration, "RuntimeError": RuntimeError,
-    "FileNotFoundError": FileNotFoundError, "OSError": OSError,
-    "IOError": IOError, "ZeroDivisionError": ZeroDivisionError,
-    "AssertionError": AssertionError, "ImportError": ImportError,
-    "NotImplementedError": NotImplementedError, "NameError": NameError,
-    "SyntaxError": SyntaxError, "IndentationError": IndentationError,
-    "KeyboardInterrupt": KeyboardInterrupt, "SystemExit": SystemExit,
-    "MemoryError": MemoryError, "RecursionError": RecursionError,
-    "OverflowError": OverflowError, "ArithmeticError": ArithmeticError,
-    "LookupError": LookupError,
-    "isinstance": isinstance, "issubclass": issubclass,
-}
+_SANDBOX_BOOTSTRAP = textwrap.dedent("""\
+    import sys, json, pathlib, traceback
+    from io import StringIO
 
-# Удалены: exec, eval, compile, __import__, input, globals, locals, vars, dir,
-# open (заменяем ниже), breakpoint, help, memoryview, __build_class__
+    # 1. Читаем конфиг из stdin (первая строка — JSON)
+    config_line = sys.stdin.readline()
+    cfg = json.loads(config_line)
 
+    download_dir = cfg["download_dir"]
+    processed_dir = cfg["processed_dir"]
+    input_path = cfg["input_path"]
+    output_path = cfg["output_path"]
+    output_dir = cfg["output_dir"]
 
-class _RestrictedOpen:
-    """Безопасная обёртка для open() — только в разрешённые директории."""
+    # 2. Ограниченные builtins
+    safe_builtins = {
+        "True": True, "False": False, "None": None,
+        "Ellipsis": Ellipsis, "NotImplemented": NotImplemented,
+        "bool": bool, "int": int, "float": float, "complex": complex,
+        "str": str, "bytes": bytes, "bytearray": bytearray,
+        "list": list, "dict": dict, "tuple": tuple, "set": set, "frozenset": frozenset,
+        "object": object, "type": type, "slice": slice,
+        "range": range, "enumerate": enumerate, "zip": zip,
+        "map": map, "filter": filter, "reversed": reversed, "sorted": sorted,
+        "iter": iter, "next": next,
+        "len": len, "min": min, "max": max, "sum": sum, "any": any, "all": all,
+        "abs": abs, "round": round, "pow": pow, "divmod": divmod,
+        "ord": ord, "chr": chr, "repr": repr, "ascii": ascii, "format": format,
+        "hash": hash, "id": id,
+        "isinstance": isinstance, "issubclass": issubclass,
+        "hasattr": hasattr, "getattr": getattr, "setattr": setattr, "delattr": delattr,
+        "callable": callable,
+        "staticmethod": staticmethod, "classmethod": classmethod,
+        "property": property, "super": super,
+        "print": print,
+        "Exception": Exception, "BaseException": BaseException,
+        "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
+        "IndexError": IndexError, "AttributeError": AttributeError,
+        "StopIteration": StopIteration, "RuntimeError": RuntimeError,
+        "FileNotFoundError": FileNotFoundError, "OSError": OSError,
+        "IOError": IOError, "ZeroDivisionError": ZeroDivisionError,
+        "AssertionError": AssertionError, "ImportError": ImportError,
+        "NotImplementedError": NotImplementedError, "NameError": NameError,
+        "SyntaxError": SyntaxError, "IndentationError": IndentationError,
+        "KeyboardInterrupt": KeyboardInterrupt, "SystemExit": SystemExit,
+        "MemoryError": MemoryError, "RecursionError": RecursionError,
+        "OverflowError": OverflowError, "ArithmeticError": ArithmeticError,
+        "LookupError": LookupError,
+    }
 
-    ALLOWED_DIRS: list[str] = []
-
-    @classmethod
-    def configure(cls, download_dir: str, processed_dir: str):
-        cls.ALLOWED_DIRS = [
-            str(Path(download_dir).resolve()),
-            str(Path(processed_dir).resolve()),
-        ]
-
-    @staticmethod
-    def restricted_open(file, mode="r", *args, **kwargs):
-        """open() только для файлов внутри download/processed."""
+    # 3. Безопасный open() — только в разрешённые директории
+    ALLOWED_DIRS = [download_dir, processed_dir]
+    _real_open = open
+    def _safe_open(file, mode="r", *args, **kwargs):
         try:
-            resolved = str(Path(file).resolve())
+            resolved = str(pathlib.Path(file).resolve())
         except Exception:
-            raise PermissionError(f"⛔ Доступ запрещён: неверный путь '{file}'")
-
-        allowed = False
-        for d in _RestrictedOpen.ALLOWED_DIRS:
+            raise PermissionError(f"Access denied: invalid path '{file}'")
+        for d in ALLOWED_DIRS:
             if resolved.startswith(d):
-                allowed = True
-                break
+                return _real_open(file, mode, *args, **kwargs)
+        raise PermissionError(f"Access denied: '{file}' not in allowed directories")
 
-        if not allowed:
-            raise PermissionError(
-                f"⛔ Доступ запрещён: файл '{file}' вне разрешённых директорий"
-            )
+    safe_builtins["open"] = _safe_open
 
-        builtins_open = __builtins__["open"] if isinstance(__builtins__, dict) else __builtins__.open
-        return builtins_open(file, mode, *args, **kwargs)
+    # 4. Импорт разрешённых модулей
+    import pandas as pd
+    import numpy as np
+    import re, datetime, math, collections, itertools, statistics, copy
 
+    # 5. Формируем namespace
+    namespace = {
+        "__builtins__": safe_builtins,
+        "pd": pd, "pandas": pd, "np": np, "numpy": np,
+        "input_path": input_path,
+        "output_path": output_path,
+        "output_dir": output_dir,
+        "re": re, "datetime": datetime, "math": math,
+        "collections": collections, "itertools": itertools,
+        "statistics": statistics, "copy": copy,
+    }
 
-# Блок-лист опасных паттернов в коде (дополнительный слой защиты)
-_BLOCKED_PATTERNS = [
-    # Shell / subprocess (даже если каким-то чудом модуль появится)
-    "subprocess",
-    "shutil",
-    "socket",
-    "ctypes",
-    # Сетевые запросы
-    "requests",
-    "urllib",
-    "http.client",
-    "httpx",
-    "aiohttp",
-    # Криптография (не нужна для работы с данными)
-    "cryptography",
-    # Системные вызовы
-    "signal",
-    "syscalls",
-    "ptrace",
-    # Обход ограничений
-    "__builtins__",
-    "__subclasses__",
-    "__mro__",
-    "__globals__",
-    "__code__",
-]
+    # Пробуем импортировать опциональные модули
+    for mod_name in ("openpyxl", "docx", "xlwt", "odf"):
+        try:
+            namespace[mod_name] = __import__(mod_name)
+        except ImportError:
+            pass
 
-
-def _execute_in_process(
-    code: str,
-    namespace: dict,
-    result_queue: multiprocessing.Queue,
-    stdout_queue: multiprocessing.Queue,
-    stderr_queue: multiprocessing.Queue,
-):
-    """
-    Выполнить код в ДОЧЕРНЕМ ПРОЦЕССЕ.
-    Эта функция запускается в отдельном процессе через multiprocessing.Process.
-    """
-    # Подсовываем ограниченные builtins
-    safe_builtins = dict(_SAFE_BUILTINS)
-    # Наш безопасный open
-    safe_builtins["open"] = _RestrictedOpen.restricted_open
-    namespace["__builtins__"] = safe_builtins
-
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
+    # 6. Читаем и выполняем код
+    code_lines = sys.stdin.read()
     redirected_out = StringIO()
     redirected_err = StringIO()
+    old_out, old_err = sys.stdout, sys.stderr
 
     try:
         sys.stdout = redirected_out
         sys.stderr = redirected_err
-        exec(code, namespace)
-        stdout_queue.put(redirected_out.getvalue())
-        stderr_queue.put(redirected_err.getvalue())
-        result_queue.put(True)
-    except Exception as e:
-        stdout_queue.put(redirected_out.getvalue())
-        stderr_queue.put(redirected_err.getvalue() + "\n" + traceback.format_exc())
-        result_queue.put(False)
+        exec(code_lines, namespace)
+        print("__EXIT_SUCCESS__", flush=True)
+    except Exception:
+        traceback.print_exc(file=redirected_err)
+        print("__EXIT_FAILURE__", flush=True)
     finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
+        sys.stdout = old_out
+        sys.stderr = old_err
+        # Выводим captured output
+        sys.stdout.write(redirected_out.getvalue())
+        sys.stderr.write(redirected_err.getvalue())
+""")
+
+# Блок-лист опасных паттернов в коде (дополнительный слой защиты)
+_BLOCKED_PATTERNS = [
+    "subprocess", "shutil", "socket", "ctypes",
+    "requests", "urllib", "http.client", "httpx", "aiohttp",
+    "cryptography", "signal", "__builtins__",
+    "__subclasses__", "__mro__", "__globals__", "__code__",
+]
 
 
 class CodeExecutor:
-    """Исполняет Python-код в отдельном процессе с ограниченным sandbox."""
-
-    # Разрешённые модули (без os, subprocess, socket и т.д.)
-    SAFE_MODULES: dict[str, object | None] = {
-        "pandas": pd,
-        "pd": pd,
-        "numpy": None,
-        "np": None,
-        "openpyxl": None,
-        "docx": None,
-        "json": __import__("json"),
-        "re": __import__("re"),
-        "datetime": __import__("datetime"),
-        "math": __import__("math"),
-        "collections": __import__("collections"),
-        "itertools": __import__("itertools"),
-        "statistics": __import__("statistics"),
-        "pathlib": __import__("pathlib"),
-        "copy": __import__("copy"),
-        "typing": __import__("typing"),
-        "os.path": __import__("os").path,  # только os.path, не os целиком
-    }
-    # ⚠️  Модуль `os` НЕ передаётся — только `os.path` для работы с путями.
-    #     Это предотвращает os.system(), os.popen(), os.spawn*() и т.д.
+    """Исполняет Python-код в отдельном subprocess с ограниченным sandbox."""
 
     def __init__(self):
-        self._lazy_modules: dict[str, bool] = {}
         from config import config as _cfg
-        _RestrictedOpen.configure(_cfg.DOWNLOAD_DIR, _cfg.PROCESSED_DIR)
+        self._download_dir = str(Path(_cfg.DOWNLOAD_DIR).resolve())
+        self._processed_dir = str(Path(_cfg.PROCESSED_DIR).resolve())
 
-    def _load_lazy(self, name: str, import_name: str):
-        """Ленивая загрузка модуля."""
-        if name not in self._lazy_modules or not self._lazy_modules[name]:
-            try:
-                module = __import__(import_name)
-                self.SAFE_MODULES[name] = module
-                self._lazy_modules[name] = True
-            except ImportError:
-                self._lazy_modules[name] = False
-
-    def _ensure_writers(self):
-        """Подгрузить модули для записи разных форматов."""
-        self._load_lazy("xlwt", "xlwt")
-        self._load_lazy("odf", "odf")
-        self._load_lazy("xml.etree.ElementTree", "xml.etree.ElementTree")
+    def _check_blocked_patterns(self, code: str) -> Optional[str]:
+        """Проверить код на опасные паттерны. Вернуть сообщение об ошибке или None."""
+        for pattern in _BLOCKED_PATTERNS:
+            if pattern in code:
+                return f"⛔ Блокирован опасный код: найден паттерн '{pattern}'"
+        return None
 
     def execute(self, code: str, input_path: str, output_path: str) -> dict:
         """
-        Выполнить Python-код в изолированном процессе.
+        Выполнить Python-код в отдельном subprocess с sandbox-ограничениями.
 
         Args:
             code: Python-код для выполнения.
@@ -228,63 +171,69 @@ class CodeExecutor:
             "output_path": output_path,
         }
 
-        # === Дополнительная проверка на опасные паттерны ===
-        for pattern in _BLOCKED_PATTERNS:
-            if pattern in code:
-                result["stderr"] = f"⛔ Блокирован опасный код: найден паттерн '{pattern}'"
-                return result
+        # === Проверка на опасные паттерны ===
+        blocked = self._check_blocked_patterns(code)
+        if blocked:
+            result["stderr"] = blocked
+            return result
 
-        # Подгрузка модулей
-        self._ensure_writers()
-        self._load_lazy("numpy", "numpy")
-        self._load_lazy("np", "numpy")
-        self._load_lazy("openpyxl", "openpyxl")
-        self._load_lazy("docx", "docx")
-
-        # Пространство имён для exec()
         output_dir = str(Path(output_path).parent)
-        namespace: dict = {
-            **self.SAFE_MODULES,
+
+        # === Конфиг для sandbox-процесса ===
+        sandbox_cfg = {
+            "download_dir": self._download_dir,
+            "processed_dir": self._processed_dir,
             "input_path": input_path,
             "output_path": output_path,
             "output_dir": output_dir,
-            "pd": pd,
         }
+        config_json = json.dumps(sandbox_cfg)
 
-        if "numpy" in namespace and namespace["numpy"] is not None:
-            namespace["np"] = namespace["numpy"]
-
-        # === Запуск в отдельном процессе (реально убивается по таймауту) ===
-        result_queue: multiprocessing.Queue = multiprocessing.Queue()
-        stdout_queue: multiprocessing.Queue = multiprocessing.Queue()
-        stderr_queue: multiprocessing.Queue = multiprocessing.Queue()
-
-        proc = multiprocessing.Process(
-            target=_execute_in_process,
-            args=(code, namespace, result_queue, stdout_queue, stderr_queue),
+        # === Запуск subprocess ===
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _SANDBOX_BOOTSTRAP],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        proc.start()
-        proc.join(timeout=120)  # 2 min timeout
 
         try:
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=5)
-                if proc.is_alive():
-                    proc.kill()
-                    proc.join()
-                result["success"] = False
-                result["stderr"] = "⏱️ Превышено время выполнения кода (120 сек). Процесс принудительно завершён."
-            else:
-                success = result_queue.get(timeout=2)
-                stdout_val = stdout_queue.get(timeout=2)
-                stderr_val = stderr_queue.get(timeout=2)
-                result["success"] = success
-                result["stdout"] = stdout_val
-                result["stderr"] = stderr_val
-        except Exception as e:
+            # Пишем конфиг (первая строка) + код (остальной stdin)
+            input_data = config_json + "\n" + code
+            stdout_raw, stderr_raw = proc.communicate(input=input_data, timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout_raw, stderr_raw = proc.communicate()
             result["success"] = False
-            result["stderr"] = traceback.format_exc()
+            result["stdout"] = stdout_raw or ""
+            result["stderr"] = (stderr_raw or "") + "\n⏱️ Превышено время выполнения кода (120 сек). Процесс принудительно завершён."
+            return result
+
+        # === Парсим результат ===
+        stdout_lines = stdout_raw.split("\n")
+        stderr_combined = stderr_raw or ""
+
+        # Ищем маркер завершения в stdout
+        success_marker = "__EXIT_SUCCESS__"
+        failure_marker = "__EXIT_FAILURE__"
+
+        clean_stdout_lines = [l for l in stdout_lines if l not in (success_marker, failure_marker)]
+        clean_stdout = "\n".join(clean_stdout_lines).strip()
+
+        if success_marker in stdout_raw:
+            result["success"] = True
+            result["stdout"] = clean_stdout
+            result["stderr"] = stderr_combined.strip()
+        elif failure_marker in stdout_raw:
+            result["success"] = False
+            result["stdout"] = clean_stdout
+            result["stderr"] = stderr_combined.strip() or "Код завершился с ошибкой."
+        else:
+            # Нет маркера — вероятно, процесс был прерван
+            result["success"] = False
+            result["stdout"] = clean_stdout
+            result["stderr"] = stderr_combined.strip() or "Процесс завершился нештатно."
 
         # Проверяем, существует ли output файл
         if not Path(output_path).exists():
