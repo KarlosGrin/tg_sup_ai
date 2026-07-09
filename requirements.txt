@@ -1,0 +1,9 @@
+aiogram
+pandas
+openpyxl
+xlwt
+odfpy
+python-docx
+numpy
+google-generativeai
+openai
