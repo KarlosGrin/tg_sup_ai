@@ -85,6 +85,29 @@ async def cmd_start(message: Message):
         Code("/clear"), " — очистить сессию\n",
         Code("/status"), " — статус сессии\n",
     )
+    # Если пользователь админ — добавляем админ-панель
+    if _is_admin(message.from_user.id):
+        welcome_text = Text(
+            Bold("👋 Привет! Я AI-помощник для работы с данными.\n\n"),
+            "Я умею:\n",
+            "📊 Анализировать Excel, CSV, Word файлы\n",
+            "✏️ Редактировать и трансформировать данные по вашим командам\n",
+            "🔗 Объединять таблицы (VLOOKUP, JOIN)\n",
+            "🧮 Создавать расчётные колонки\n",
+            "📋 Фильтровать, сортировать, удалять дубликаты\n\n",
+            "📤 ", Bold("Просто загрузи файл"), " и напиши, что нужно сделать!\n\n",
+            "Доступные команды:\n",
+            Code("/start"), " — показать это сообщение\n",
+            Code("/help"), " — справка\n",
+            Code("/files"), " — список загруженных файлов\n",
+            Code("/clear"), " — очистить сессию\n",
+            Code("/status"), " — статус сессии\n\n",
+            Bold("🛠 Команды администратора:\n"),
+            Code("/admin"), " — панель администратора\n",
+            Code("/stats"), " — статистика бота\n",
+            Code("/broadcast"), " — рассылка пользователям\n",
+        )
+
     await message.answer(welcome_text.as_html())
 
 
@@ -166,6 +189,80 @@ async def cmd_status(message: Message):
     await message.answer(Text(*status_lines).as_html())
 
 
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    """Панель администратора (только для ADMIN_IDS)."""
+    user_id = message.from_user.id
+    if not _is_admin(user_id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+
+    admin_id = message.from_user.id
+    active_users = len(user_sessions)
+    total_files = sum(len(s.get("file_paths", [])) for s in user_sessions.values())
+
+    admin_text = (
+        f"🛠 **Панель администратора**\n\n"
+        f"👤 Ваш ID: `{admin_id}`\n"
+        f"👥 Активных сессий: `{active_users}`\n"
+        f"📎 Всего файлов в сессиях: `{total_files}`\n\n"
+        f"**Команды:**\n"
+        f"`/broadcast <текст>` — отправить сообщение всем активным пользователям\n"
+        f"`/stats` — полная статистика бота"
+    )
+    await message.answer(admin_text)
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    """Отправить сообщение всем активным пользователям (только админ)."""
+    user_id = message.from_user.id
+    if not _is_admin(user_id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+
+    text = message.text.replace("/broadcast", "", 1).strip()
+    if not text:
+        await message.answer("❌ Укажите текст для рассылки.\nПример: `/broadcast Всем привет!`")
+        return
+
+    sent = 0
+    for uid in list(user_sessions.keys()):
+        try:
+            await message.bot.send_message(chat_id=uid, text=f"📢 **Сообщение от администратора:**\n\n{text}")
+            sent += 1
+        except Exception:
+            pass
+
+    await message.answer(f"✅ Сообщение отправлено `{sent}` пользователям.")
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Статистика бота (только админ)."""
+    user_id = message.from_user.id
+    if not _is_admin(user_id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+
+    total_users = len(user_sessions)
+    total_files = 0
+    total_history = 0
+    for s in user_sessions.values():
+        total_files += len(s.get("file_paths", []))
+        total_history += len(s.get("history", []))
+
+    stats_text = (
+        f"📊 **Статистика бота**\n\n"
+        f"👥 Пользователей в сессиях: `{total_users}`\n"
+        f"📎 Всего файлов: `{total_files}`\n"
+        f"💬 Сообщений в истории: `{total_history}`\n"
+        f"⚙️ Провайдер: `{config.AI_PROVIDER}`\n"
+        f"🔧 Режим exec: `{config.EXECUTION_MODE}`"
+    )
+    await message.answer(stats_text)
+
+
 @router.message(F.document)
 async def handle_document(message: Message, bot: Bot):
     """Обработчик загрузки документов."""
@@ -210,8 +307,10 @@ async def handle_document(message: Message, bot: Bot):
             parse_mode="Markdown",
             reply_markup=quick_actions_keyboard(),
         )
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка при загрузке файла: {e}")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        await status_msg.edit_text("❌ Ошибка при загрузке файла. Проверьте формат и попробуйте снова.")
 
 
 # ===== CALLBACK QUERY HANDLERS =====
@@ -422,8 +521,8 @@ async def handle_text(message: Message):
             return
 
         if config.EXECUTION_MODE == "assistants":
-            # Режим песочницы Gemini — выполняем сразу (код генерирует сама Gemini)
-            await status_msg.edit_text("⏳ Обрабатываю через песочницу Gemini...")
+            # Gemini генерирует код (читает файл через File API), но exec ЛОКАЛЬНЫЙ
+            await status_msg.edit_text("⏳ Gemini генерирует код...")
             execution_result = await _execute_code(code, output_path, input_path=file_paths[0] if file_paths else None)
             await _send_report(status_msg, analysis, explanation, execution_result)
             await _send_result_file(message, user_id, output_path, execution_result, session)
@@ -444,10 +543,10 @@ async def handle_text(message: Message):
             reply_markup=confirmation_keyboard(),
         )
 
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Критическая ошибка: {e}")
+    except Exception:
         import traceback
         traceback.print_exc()
+        await status_msg.edit_text("❌ Внутренняя ошибка при обработке запроса. Попробуйте позже.")
 
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
@@ -467,12 +566,11 @@ async def _process_ai_request(user_id: int, command: str, file_paths: list[str])
     output_path = str(Path(config.PROCESSED_DIR) / output_name)
 
     if config.EXECUTION_MODE == "assistants":
-        # Режим песочницы Gemini: код не генерируем,
-        # Gemini сама выполнит всю обработку в _execute_code
+        # Gemini читает файл через File API, генерирует код, exec — локальный
         return (
-            command,                          # analysis = команда пользователя
-            "",                               # code = пусто (не используется)
-            "Обработка в песочнице Gemini...",  # explanation
+            command,
+            "",
+            "Обработка через Gemini (код выполняется локально)...",
             output_path,
         )
 
@@ -520,7 +618,7 @@ async def _execute_code(code: str, output_path: str, input_path: str | None = No
         }
 
     if config.EXECUTION_MODE == "assistants":
-        # Выполнение в песочнице Gemini (безопаснее, без локального exec)
+        # Gemini генерирует код, exec — ЛОКАЛЬНЫЙ (через тот же code_executor)
         execution_result = await gemini_assistant.execute(
             code=code, input_path=input_path, output_path=output_path
         )
@@ -557,24 +655,17 @@ async def _send_report(status_msg, analysis: str, explanation: str, execution_re
 
 
 async def _send_result_file(message: Message, user_id: int, output_path: str, execution_result: dict, session: dict):
-    """Найти созданный файл и отправить его пользователю."""
+    """Найти созданный файл и отправить его пользователю (только файлы этого пользователя)."""
     from aiogram.types import FSInputFile
-    processed_dir = Path(config.PROCESSED_DIR)
     output_path_obj = Path(output_path)
-    found_file = None
     now = time.time()
 
     if output_path_obj.exists():
         found_file = output_path_obj
     else:
-        # Ищем ЛЮБОЙ файл младше 60 секунд
-        all_recent = sorted(
-            [f for f in processed_dir.iterdir() if f.is_file() and now - f.stat().st_mtime < 60],
-            key=os.path.getmtime,
-            reverse=True,
-        )
-        if all_recent:
-            found_file = all_recent[0]
+        # ⚠️ Больше НЕ ищем «любой недавний файл» — это приводило бы к утечке данных
+        # между пользователями. Если файла нет — просто сообщаем об этом.
+        found_file = None
 
     if found_file:
         file_service.save_processed(found_file, user_id)
@@ -588,11 +679,10 @@ async def _send_result_file(message: Message, user_id: int, output_path: str, ex
         BINARY_EXTENSIONS = {".xlsx", ".xls", ".ods", ".docx", ".doc"}
         if found_file.suffix.lower() in BINARY_EXTENSIONS:
             try:
-                # Читаем первые 100 байт — если не ZIP/OLE2, значит это текст
                 header = found_file.read_bytes()[:4]
                 is_actually_text = header not in (
-                    b"\x50\x4B\x03\x04",  # ZIP (xlsx, docx)
-                    b"\xD0\xCF\x11\xE0",  # OLE2 (xls, doc)
+                    b"\x50\x4B\x03\x04",
+                    b"\xD0\xCF\x11\xE0",
                 )
                 if is_actually_text:
                     txt_name = Path(display_name).with_suffix(".txt").name
@@ -608,7 +698,9 @@ async def _send_result_file(message: Message, user_id: int, output_path: str, ex
     else:
         stdout_text = execution_result.get("stdout", "").strip()
         if stdout_text:
-            txt_path = Path(config.PROCESSED_DIR) / f"output_{int(now)}.txt"
+            user_processed = Path(config.PROCESSED_DIR) / str(user_id)
+            user_processed.mkdir(parents=True, exist_ok=True)
+            txt_path = user_processed / f"output_{int(now)}.txt"
             txt_path.write_text(stdout_text, encoding="utf-8")
             await message.answer_document(
                 document=FSInputFile(path=str(txt_path), filename="output.txt"),
@@ -675,10 +767,10 @@ async def _process_action(
             await _send_report(msg, analysis, explanation, execution_result)
             await _send_result_file(msg, user_id, output_path, execution_result, session)
 
-    except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+    except Exception:
         import traceback
         traceback.print_exc()
+        await msg.answer("❌ Внутренняя ошибка при обработке. Попробуйте позже.")
 
 
 @router.message()

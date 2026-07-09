@@ -1,11 +1,9 @@
 """
 Gemini Assistant — гибридный режим: загрузка в File API + локальный exec.
 
-Вместо того чтобы выполнять код в песочнице Gemini (которая не имеет
-сетевого доступа к File API), этот сервис:
-1. Загружает файл в Gemini File API (Gemini может прочитать его нативно)
-2. Gemini генерирует Python-код для обработки (как и ai_service)
-3. Код выполняется ЛОКАЛЬНО через code_executor
+ВНИМАНИЕ: Этот режим НЕ выполняет код в песочнице Gemini.
+Gemini читает файл через File API и генерирует Python-код,
+НО код выполняется ЛОКАЛЬНО через code_executor (с sandbox-ограничениями).
 
 Использование:
     EXECUTION_MODE=assistants в .env + AI_PROVIDER=gemini
@@ -30,7 +28,7 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT_PATH.read_text(encoding="utf-8") if _SYSTEM_PROMP
 class GeminiAssistant:
     """
     Гибридный режим: Gemini читает файл через File API, генерирует код,
-    код выполняется локально.
+    код выполняется локально (НЕ в песочнице Gemini).
     """
 
     def __init__(self):

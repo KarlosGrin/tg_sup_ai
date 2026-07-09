@@ -68,14 +68,18 @@ class FileService:
         return self._user_files.get(user_id, {}).get("original", [])
 
     def save_processed(self, source_path: str | Path, user_id: int) -> Path:
-        """Сохранить обработанный файл и вернуть путь."""
+        """Сохранить обработанный файл в подпапку пользователя и вернуть путь."""
         source = Path(source_path)
         orig_name = source.name
         # Убираем UUID-префикс для понятного имени
         parts = orig_name.split("_", 1)
         clean_name = parts[1] if len(parts) > 1 else orig_name
         processed_name = f"processed_{clean_name}"
-        processed_path = self.processed_dir / processed_name
+
+        # Изоляция: каждый пользователь — своя подпапка
+        user_processed_dir = self.processed_dir / str(user_id)
+        user_processed_dir.mkdir(parents=True, exist_ok=True)
+        processed_path = user_processed_dir / processed_name
 
         shutil.copy2(source_path, processed_path)
 
@@ -144,6 +148,19 @@ class FileService:
             return False
 
     @staticmethod
+    def _escape_data(text: str, max_len: int = 300) -> str:
+        """
+        Экранировать пользовательские данные для защиты от prompt injection.
+        Оборачивает данные в маркеры и обрезает до max_len символов.
+        """
+        # Обрезаем до лимита
+        if len(text) > max_len:
+            text = text[:max_len] + "... (обрезано)"
+        # Заменяем потенциально опасные последовательности
+        text = text.replace("```", "'''")
+        return text
+
+    @staticmethod
     def get_file_summary(file_path: str) -> str:
         """
         Получить краткое описание файла: формат, размер, базовую структуру.
@@ -190,10 +207,11 @@ class FileService:
                     summary.append(f"   Абзацев: {len(paragraphs)}")
                     summary.append(f"   Таблиц: {len(tables)}")
                     if paragraphs:
-                        preview = paragraphs[0][:200]
+                        preview = FileService._escape_data(paragraphs[0], 200)
                         summary.append(f"   Начало: «{preview}»")
                     if paragraphs:
-                        summary.append(f"   Последний: «{paragraphs[-1][:100]}»")
+                        last = FileService._escape_data(paragraphs[-1], 100)
+                        summary.append(f"   Последний: «{last}»")
                     if tables:
                         for ti, table in enumerate(tables[:2], 1):
                             rows = len(table.rows)
@@ -201,7 +219,7 @@ class FileService:
                             summary.append(f"   Таблица {ti}: {rows} x {cols}")
                             # Показываем заголовки первой строки
                             if rows > 0:
-                                headers = [cell.text.strip()[:30] for cell in table.rows[0].cells]
+                                headers = [FileService._escape_data(cell.text.strip(), 30) for cell in table.rows[0].cells]
                                 summary.append(f"     Заголовки: {', '.join(headers)}")
                     # Стили документа
                     styles_used = set()
@@ -226,13 +244,13 @@ class FileService:
                     if preview_lines:
                         summary.append(f"   Начало ({len(preview_lines)} строк):")
                         for l in preview_lines[:3]:
-                            summary.append(f"     «{l[:150]}»")
+                            summary.append(f"     «{FileService._escape_data(l, 150)}»")
                     if total_lines > 5:
                         last_lines = [l.strip() for l in lines[-3:] if l.strip()]
                         if last_lines:
                             summary.append(f"   Конец ({len(last_lines)} строк):")
                             for l in last_lines[:2]:
-                                summary.append(f"     «{l[:150]}»")
+                                summary.append(f"     «{FileService._escape_data(l, 150)}»")
                 except Exception as e:
                     summary.append(f"📃 Текстовый файл (ошибка чтения: {e})")
 

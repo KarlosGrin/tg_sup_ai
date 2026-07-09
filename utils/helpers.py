@@ -57,24 +57,9 @@ def sanitize_for_markdown(text: str) -> str:
 
 def find_output_file(output_path: str, base_dir: str = "processed") -> Optional[str]:
     """
-    Найти созданный выходной файл. Если файл не найден по точному пути,
-    ищет похожие файлы в директории.
+    Найти созданный выходной файл. Только по точному пути — никакого
+    «поиска похожих», чтобы не перепутать файлы разных пользователей.
     """
     if os.path.exists(output_path):
         return output_path
-
-    output_dir = Path(base_dir)
-    if not output_dir.exists():
-        return None
-
-    # Ищем по имени (без UUID)
-    output_name = Path(output_path).name
-    parts = output_name.split("_", 1)
-    search_name = parts[1] if len(parts) > 1 else output_name
-    base_name = os.path.splitext(search_name)[0]
-
-    candidates = list(output_dir.glob(f"*{base_name}*"))
-    if candidates:
-        return str(max(candidates, key=os.path.getmtime))
-
     return None
