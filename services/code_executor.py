@@ -31,7 +31,32 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent("""\
     output_path = cfg["output_path"]
     output_dir = cfg["output_dir"]
 
-    # 2. Ограниченные builtins
+    # 2. Импорт разрешённых модулей (ДО ограничения builtins — нужен __import__)
+    import pandas as pd
+    import numpy as np
+    import re, datetime, math, collections, itertools, statistics, copy
+    import json as _json_mod
+
+    # 3. Белый список модулей, которые можно импортировать из пользовательского кода
+    _ALLOWED_IMPORTS = {
+        "pandas", "numpy", "openpyxl", "docx", "xlwt", "odf",
+        "re", "datetime", "math", "collections", "itertools", "statistics", "copy",
+        "json", "pathlib", "io", "typing", "os.path", "os",
+        "xml", "xml.etree", "xml.etree.ElementTree",
+    }
+
+    _real_import = __import__
+    def _safe_import(name, *args, **kwargs):
+        # Прямое совпадение
+        if name in _ALLOWED_IMPORTS:
+            return _real_import(name, *args, **kwargs)
+        # Субмодули разрешённых модулей (openpyxl.styles, xml.etree.ElementTree и т.д.)
+        for allowed in _ALLOWED_IMPORTS:
+            if name.startswith(allowed + "."):
+                return _real_import(name, *args, **kwargs)
+        raise ImportError(f"⛔ Импорт модуля '{name}' запрещён по соображениям безопасности")
+
+    # 4. Ограниченные builtins (с безопасным __import__ и open)
     safe_builtins = {
         "True": True, "False": False, "None": None,
         "Ellipsis": Ellipsis, "NotImplemented": NotImplemented,
@@ -65,9 +90,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent("""\
         "MemoryError": MemoryError, "RecursionError": RecursionError,
         "OverflowError": OverflowError, "ArithmeticError": ArithmeticError,
         "LookupError": LookupError,
+        "__import__": _safe_import,
     }
 
-    # 3. Безопасный open() — только в разрешённые директории
+    # 5. Безопасный open() — только в разрешённые директории
     ALLOWED_DIRS = [download_dir, processed_dir]
     _real_open = open
     def _safe_open(file, mode="r", *args, **kwargs):
@@ -82,12 +108,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent("""\
 
     safe_builtins["open"] = _safe_open
 
-    # 4. Импорт разрешённых модулей
-    import pandas as pd
-    import numpy as np
-    import re, datetime, math, collections, itertools, statistics, copy
-
-    # 5. Формируем namespace
+    # 6. Формируем namespace
     namespace = {
         "__builtins__": safe_builtins,
         "pd": pd, "pandas": pd, "np": np, "numpy": np,
@@ -106,7 +127,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent("""\
         except ImportError:
             pass
 
-    # 6. Читаем и выполняем код
+    # 7. Читаем и выполняем код
     code_lines = sys.stdin.read()
     redirected_out = StringIO()
     redirected_err = StringIO()
@@ -152,6 +173,33 @@ class CodeExecutor:
                 return f"⛔ Блокирован опасный код: найден паттерн '{pattern}'"
         return None
 
+    @staticmethod
+    def _sanitize_code(code: str) -> str:
+        """
+        Постобработка AI-кода: удаляем хардкоженные пути и лишние импорты,
+        чтобы AI не переопределял переменные input_path / output_path.
+        """
+        import re
+        lines = code.split("\n")
+        cleaned = []
+        for line in lines:
+            stripped = line.strip()
+            # Удаляем строки вида `input_path = '...'` или `output_path = "..."` (хардкод)
+            if re.match(r'^(input_path|output_path|output_dir)\s*=\s*[\'"]', stripped):
+                cleaned.append(f"# {stripped}  # (заменено sandbox-ом)")
+                continue
+            # Удаляем `import pandas as pd` — pd уже в namespace
+            if re.match(r'^import\s+pandas', stripped):
+                continue
+            # Удаляем `from pandas import ...`
+            if re.match(r'^from\s+pandas', stripped):
+                continue
+            # Удаляем `import numpy as np` — np уже в namespace
+            if re.match(r'^import\s+numpy', stripped):
+                continue
+            cleaned.append(line)
+        return "\n".join(cleaned)
+
     def execute(self, code: str, input_path: str, output_path: str) -> dict:
         """
         Выполнить Python-код в отдельном subprocess с sandbox-ограничениями.
@@ -177,17 +225,28 @@ class CodeExecutor:
             result["stderr"] = blocked
             return result
 
-        output_dir = str(Path(output_path).parent)
+        # === Постобработка AI-кода: убираем хардкоженные пути и дублирующие импорты ===
+        code = self._sanitize_code(code)
+
+        # ⚠️ Резолвим пути в абсолютные — subprocess может иметь другой CWD
+        input_path_abs = str(Path(input_path).resolve())
+        output_path_abs = str(Path(output_path).resolve())
+        output_dir_abs = str(Path(output_path_abs).parent)
 
         # === Конфиг для sandbox-процесса ===
         sandbox_cfg = {
             "download_dir": self._download_dir,
             "processed_dir": self._processed_dir,
-            "input_path": input_path,
-            "output_path": output_path,
-            "output_dir": output_dir,
+            "input_path": input_path_abs,
+            "output_path": output_path_abs,
+            "output_dir": output_dir_abs,
         }
         config_json = json.dumps(sandbox_cfg)
+
+        print(f"[CodeExecutor] Запуск subprocess cwd={Path.cwd()}")
+        print(f"[CodeExecutor] input={input_path_abs}")
+        print(f"[CodeExecutor] output={output_path_abs}")
+        print(f"[CodeExecutor] код (первые 200 символов): {code[:200]}")
 
         # === Запуск subprocess ===
         proc = subprocess.Popen(
@@ -196,12 +255,15 @@ class CodeExecutor:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            cwd=str(Path.cwd()),
         )
 
         try:
             # Пишем конфиг (первая строка) + код (остальной stdin)
             input_data = config_json + "\n" + code
             stdout_raw, stderr_raw = proc.communicate(input=input_data, timeout=120)
+            print(f"[CodeExecutor] stdout ({len(stdout_raw)} chars)")
+            print(f"[CodeExecutor] stderr ({len(stderr_raw)} chars): {stderr_raw[:500]}")
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_raw, stderr_raw = proc.communicate()
@@ -236,7 +298,10 @@ class CodeExecutor:
             result["stderr"] = stderr_combined.strip() or "Процесс завершился нештатно."
 
         # Проверяем, существует ли output файл
-        if not Path(output_path).exists():
+        if Path(output_path_abs).exists():
+            print(f"[CodeExecutor] ✅ Файл создан: {output_path_abs}")
+        else:
+            print(f"[CodeExecutor] ❌ Файл НЕ создан: {output_path_abs}")
             result["stderr"] += "\n[WARNING] Файл результата не был создан по указанному пути."
 
         return result

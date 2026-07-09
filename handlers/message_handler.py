@@ -523,7 +523,11 @@ async def handle_text(message: Message):
         if config.EXECUTION_MODE == "assistants":
             # Gemini генерирует код (читает файл через File API), но exec ЛОКАЛЬНЫЙ
             await status_msg.edit_text("⏳ Gemini генерирует код...")
-            execution_result = await _execute_code(code, output_path, input_path=file_paths[0] if file_paths else None)
+            execution_result = await _execute_code(
+                code, output_path,
+                input_path=file_paths[0] if file_paths else None,
+                user_command=command,
+            )
             await _send_report(status_msg, analysis, explanation, execution_result)
             await _send_result_file(message, user_id, output_path, execution_result, session)
             return
@@ -603,7 +607,8 @@ async def _process_ai_request(user_id: int, command: str, file_paths: list[str])
     )
 
 
-async def _execute_code(code: str, output_path: str, input_path: str | None = None) -> dict:
+async def _execute_code(code: str, output_path: str, input_path: str | None = None,
+                        user_command: str = "") -> dict:
     """Удалить старый output, выполнить код, вернуть результат."""
     old_output = Path(output_path)
     if old_output.exists():
@@ -620,7 +625,8 @@ async def _execute_code(code: str, output_path: str, input_path: str | None = No
     if config.EXECUTION_MODE == "assistants":
         # Gemini генерирует код, exec — ЛОКАЛЬНЫЙ (через тот же code_executor)
         execution_result = await gemini_assistant.execute(
-            code=code, input_path=input_path, output_path=output_path
+            code=code, input_path=input_path, output_path=output_path,
+            user_command=user_command,
         )
     else:
         # Локальное выполнение через изолированный exec()
@@ -642,16 +648,26 @@ async def _send_report(status_msg, analysis: str, explanation: str, execution_re
 
     stdout = execution_result.get("stdout", "").strip()
     if stdout:
-        parts.append(f"\n📤 **Вывод:**\n```\n{stdout[:1000]}\n```")
+        # Экранируем HTML-спецсимволы, чтобы Telegram не пытался парсить их как теги
+        safe_stdout = stdout[:1000].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        parts.append(f"\n📤 **Вывод:**\n```\n{safe_stdout}\n```")
 
     stderr = execution_result.get("stderr", "").strip()
     if stderr:
-        parts.append(f"\n⚠️ **Логи/Ошибки:**\n```\n{stderr[:1500]}\n```")
+        safe_stderr = stderr[:1500].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        parts.append(f"\n⚠️ **Логи/Ошибки:**\n```\n{safe_stderr}\n```")
 
     if explanation:
         parts.append(f"\n💡 **Пояснение:**\n{sanitize_for_markdown(explanation)}")
 
-    await status_msg.edit_text("\n".join(parts))
+    try:
+        await status_msg.edit_text("\n".join(parts), parse_mode="Markdown")
+    except Exception:
+        # Если Markdown не спарсился — пробуем без форматирования
+        try:
+            await status_msg.edit_text("\n".join(parts), parse_mode=None)
+        except Exception:
+            pass  # Если и так не вышло — игнорируем, бот жив
 
 
 async def _send_result_file(message: Message, user_id: int, output_path: str, execution_result: dict, session: dict):

@@ -38,10 +38,16 @@ class GeminiAssistant:
         self._tmp_files: list[str] = []
         print(f"[GeminiAssistant] Гибридный режим, модель: {self.model}")
 
-    async def execute(self, code: str, input_path: str, output_path: str) -> dict:
+    async def execute(self, code: str, input_path: str, output_path: str, user_command: str = "") -> dict:
         """
         Загрузить файл в Gemini File API → Gemini генерирует код →
         выполнить код локально.
+
+        Args:
+            code: Python-код (не используется в этом режиме, параметр для совместимости).
+            input_path: Путь к исходному файлу.
+            output_path: Путь для сохранения результата.
+            user_command: Команда пользователя (текст запроса).
 
         Returns:
             dict: {success, stdout, stderr, output_path}
@@ -68,7 +74,7 @@ class GeminiAssistant:
 
             # 3. Gemini генерирует код (читает файл нативно через File API)
             file_name = Path(input_path).name
-            ai_result = await self._generate_code(file_name, file_uri, input_path, output_path)
+            ai_result = await self._generate_code(file_name, file_uri, input_path, output_path, user_command)
 
             if not ai_result:
                 result["stderr"] = "❌ Gemini не смог сгенерировать код."
@@ -106,10 +112,11 @@ class GeminiAssistant:
             self._cleanup_tmp()
 
     async def _generate_code(
-        self, file_name: str, file_uri: str, input_path: str, output_path: str
+        self, file_name: str, file_uri: str, input_path: str, output_path: str,
+        user_command: str = "",
     ) -> Optional[dict]:
         """Отправить файл (через URI) в Gemini и получить сгенерированный код."""
-        prompt = self._build_prompt(file_name, file_uri, input_path, output_path)
+        prompt = self._build_prompt(file_name, file_uri, input_path, output_path, user_command)
 
         try:
             response = await asyncio.to_thread(
@@ -182,10 +189,12 @@ class GeminiAssistant:
     # Промпт и парсинг
     # ----------------------------------------------------------------
 
-    def _build_prompt(self, file_name: str, file_uri: str, input_path: str, output_path: str) -> str:
+    def _build_prompt(self, file_name: str, file_uri: str, input_path: str, output_path: str,
+                      user_command: str = "") -> str:
         """Сформировать промпт: Gemini читает файл через File API и генерирует код."""
         ext = Path(input_path).suffix.lower()
         system = SYSTEM_PROMPT.format(input_path=input_path, output_path=output_path) if SYSTEM_PROMPT else ""
+        user_cmd = user_command if user_command else "Выполни анализ данных и сохрани результат в файл."
 
         return f"""{system}
 
@@ -194,13 +203,33 @@ class GeminiAssistant:
 Ты можешь прочитать его содержимое напрямую по URI: {file_uri}
 
 ## Команда пользователя
-{{user_command}}
+{user_cmd}
+
+## 🔴 ВЕРСИЯ БИБЛИОТЕК
+- **pandas 3.0+** — `fillna(method='ffill')` удалён, используй `df.ffill()` или `df.fillna(method='ffill')`→ заменить на `df.ffill()`
+- **openpyxl 3.1+**
+- **numpy 2.5+**
+
+## 🔴 КРИТИЧЕСКИ ВАЖНО: ПЕРЕМЕННЫЕ УЖЕ ДОСТУПНЫ
+В коде уже объявлены и доступны следующие переменные:
+- `input_path` — полный путь к входному файлу (НЕ создавай свою переменную)
+- `output_path` — полный путь для сохранения результата (НЕ создавай свою переменную)
+- `output_dir` — директория для сохранения (НЕ создавай свою переменную)
+- `pd` / `pandas` — уже импортирован
+- `np` / `numpy` — уже импортирован
+- `os` / `os.path` — уже доступен
+
+НЕ ПИШИ: `input_path = "..."` или `output_path = "..."` — используй готовые переменные.
+НЕ ПИШИ: `import pandas as pd` — pd уже есть.
+НЕ ПИШИ: `import os` — os уже доступен.
+
+ПРАВИЛЬНО: `df = pd.read_excel(input_path)`
+ПРАВИЛЬНО: `df.to_excel(output_path, index=False)`
+НЕПРАВИЛЬНО: `input_path = 'downloads/file.xlsx'` (перезапишет переменную!)
 
 ## Важно
 - Прочитай файл через его URI: {file_uri}
 - Сгенерируй Python-код для обработки данных
-- Путь для чтения (локальный): {input_path}
-- Путь для сохранения: {output_path}
 - Верни ТОЛЬКО JSON: analysis, code, explanation
 
 ## Формат ответа
