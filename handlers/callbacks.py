@@ -9,11 +9,13 @@ from aiogram import Router
 from aiogram.types import CallbackQuery
 
 from handlers.common import (
-    _execute_code,
     _get_session,
-    _process_action,
-    _send_report,
-    _send_result_file,
+)
+from services.pipeline import (
+    execute_code,
+    process_action,
+    send_report,
+    send_result_file,
 )
 from utils.keyboards import (
     format_selection_keyboard,
@@ -89,15 +91,15 @@ async def callback_action(callback: CallbackQuery):
 
     elif action == "save_docx":
         command = "Сохрани данные в формате DOCX (Word)"
-        await _process_action(callback.message, user_id, command, require_confirm=False)
+        await process_action(callback.message, user_id, command, require_confirm=False)
 
     elif action == "save_xlsx":
         command = "Сохрани данные в формате XLSX (Excel)"
-        await _process_action(callback.message, user_id, command, require_confirm=False)
+        await process_action(callback.message, user_id, command, require_confirm=False)
 
     elif action == "save_txt":
         command = "Сохрани данные в формате TXT"
-        await _process_action(callback.message, user_id, command, require_confirm=False)
+        await process_action(callback.message, user_id, command, require_confirm=False)
 
     else:
         await callback.message.edit_text(
@@ -134,13 +136,13 @@ async def callback_confirm(callback: CallbackQuery):
 
     await callback.message.edit_text("⏳ Выполняю код...")
 
-    execution_result = await _execute_code(
+    execution_result = await execute_code(
         code, output_path,
         input_path=pending.get("input_path"),
     )
 
-    await _send_report(callback.message, analysis, explanation, execution_result)
-    await _send_result_file(callback.message, user_id, output_path, execution_result, session)
+    await send_report(callback.message, analysis, explanation, execution_result)
+    await send_result_file(callback.message, user_id, output_path, execution_result, session)
     await callback.answer()
 
 
@@ -165,5 +167,5 @@ async def callback_format(callback: CallbackQuery):
         return
 
     command = f"Сконвертируй данные в формат {target_format}"
-    await _process_action(callback.message, user_id, command, require_confirm=False)
+    await process_action(callback.message, user_id, command, require_confirm=False)
     await callback.answer()

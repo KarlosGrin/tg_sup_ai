@@ -2,10 +2,9 @@
 Вспомогательные утилиты.
 """
 
-import re
 import os
+import re
 from pathlib import Path
-from typing import Optional
 
 
 def clean_filename(filename: str) -> str:
@@ -55,7 +54,33 @@ def sanitize_for_markdown(text: str) -> str:
     return "\n".join(cleaned)
 
 
-def find_output_file(output_path: str, base_dir: str = "processed") -> Optional[str]:
+_LOGGED_API_KEY_PATTERNS = [
+    r'(sk-[A-Za-z0-9_-]{20,})',         # OpenAI ключи (sk-proj-, sk-, sk-svcacct-)
+    r'(org-[A-Za-z0-9_-]{20,})',        # OpenAI Organization ID
+    r'(AIza[0-9A-Za-z_-]{35})',         # Gemini ключи
+    r'(xox[bpsa]-[A-Za-z0-9-]{10,})',   # Slack-подобные
+    r'(ghp_[A-Za-z0-9_]{36})',          # GitHub Personal Access Token
+    r'(gho_[A-Za-z0-9_]{36})',          # GitHub OAuth Access Token
+    r'(github_pat_[A-Za-z0-9_-]{80,})', # GitHub Fine-Grained Token
+    r'(token:[A-Za-z0-9_-]{40,})',      # Generic token:...
+    r'(api[-_]?key[-_]?[=:].{8,})',     # Generic api_key/api-key pattern
+]
+
+
+def sanitize_log(text: str) -> str:
+    """
+    Очистить строку от потенциально опасных данных для логов:
+    - API-ключи
+    - Токены
+    Заменяет их на '***REDACTED***'.
+    """
+    import re
+    for pattern in _LOGGED_API_KEY_PATTERNS:
+        text = re.sub(pattern, r'***REDACTED***', text)
+    return text
+
+
+def find_output_file(output_path: str, base_dir: str = "processed") -> str | None:
     """
     Найти созданный выходной файл. Только по точному пути — никакого
     «поиска похожих», чтобы не перепутать файлы разных пользователей.

@@ -6,15 +6,16 @@ Unit-тесты для CodeExecutor (песочница исполнения к�
     python -m pytest tests/test_code_executor.py -v --tb=short
 """
 
-import pytest
 import json
 import sys
 from pathlib import Path
 
+import pytest
+
 # Добавляем корень проекта в sys.path для импорта сервисов
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from services.code_executor import CodeExecutor, _BLOCKED_PATTERNS
+from services.code_executor import _BLOCKED_PATTERNS, CodeExecutor
 
 
 @pytest.fixture(autouse=True)
@@ -213,8 +214,8 @@ df.to_excel(output_path, index=False)
         result = executor.execute(code, str(sample_excel), str(output_path))
         assert result["success"], f"__class__.__name__ blocked: {result['stderr']}"
 
-    def test_ast_allows_getattr_legitimate(self, executor, sample_excel, output_path):
-        """getattr(df, 'name') — не dunder, не блокируется."""
+    def test_block_getattr_removed_from_sandbox(self, executor, sample_excel, output_path):
+        """getattr() удалён из safe_builtins — даже легитимный вызов блокируется в sandbox."""
         code = """
 import pandas as pd
 df = pd.read_excel(input_path)
@@ -223,8 +224,9 @@ print(f"Got column: {col.name}")
 df.to_excel(output_path, index=False)
 """
         result = executor.execute(code, str(sample_excel), str(output_path))
-        assert result["success"], f"getattr blocked: {result['stderr']}"
-        assert output_path.exists()
+        # getattr удалён из safe_builtins — sandbox вернёт NameError
+        assert not result["success"]
+        assert "getattr" in result["stderr"] or "NameError" in result["stderr"] or "не определён" in result["stderr"]
 
     def test_ast_allows_dict_access(self, executor, sample_excel, output_path):
         """obj.__dict__ — в whitelist-е, должен работать."""
@@ -392,7 +394,6 @@ df.to_csv(output_path, index=False)
         """JSON: чтение/запись."""
         download_dir = tmp_path / "downloads"
         download_dir.mkdir(exist_ok=True)
-        import json
         input_path = download_dir / "test.json"
         input_path.write_text(json.dumps({"items": [1, 2, 3]}))
 

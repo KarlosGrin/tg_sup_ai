@@ -2,18 +2,14 @@
 Unit-тесты для AIService (без реальных сетевых вызовов).
 """
 
-import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from services.ai_service import AIService, _is_retryable_openai, _is_retryable_gemini
-from services.ai_service import _AI_RETRY_CONFIG
-
+from services.ai_service import _AI_RETRY_CONFIG, AIService, _is_retryable_openai
 
 # ===== _parse_response =====
 
@@ -83,9 +79,9 @@ class TestParseResponse:
 
 def _make_openai_exc(exc_cls, message="test error"):
     """Создать исключение openai с корректными аргументами конструктора."""
-    import httpx
-    import openai
     import inspect
+
+    import httpx
 
     sig = inspect.signature(exc_cls.__init__)
     params = list(sig.parameters.keys())
@@ -164,8 +160,6 @@ class TestRetryWithMock:
     @pytest.fixture
     def service(self, mocker):
         """AIService с замоканным OpenAI клиентом."""
-        import httpx
-        import openai
         s = AIService()
         s._openai_model = "gpt-4o"
         s._openai_max_tokens = 100
@@ -218,7 +212,6 @@ class TestGenerateCode:
 
     def test_generate_code_success(self, mocker):
         """generate_code возвращает распарсенный dict при успешном вызове."""
-        import openai
         s = AIService()
         s._openai_model = "gpt-4o"
         s._openai_max_tokens = 100

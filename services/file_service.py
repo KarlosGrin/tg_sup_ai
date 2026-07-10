@@ -3,13 +3,13 @@
 """
 
 import os
+import shutil
 import time
 import uuid
-import shutil
 from pathlib import Path
-from typing import Optional
 
-from aiogram.types import Document, Message
+from aiogram.types import Document
+
 from config import config
 
 
@@ -35,7 +35,7 @@ class FileService:
         # Хранилище: user_id -> {"original": [пути], "processed": [пути]}
         self._user_files: dict[int, dict[str, list[str]]] = {}
 
-    async def download_file(self, document: Document, user_id: int, bot=None) -> Optional[Path]:
+    async def download_file(self, document: Document, user_id: int, bot=None) -> Path | None:
         """Скачать файл из Telegram во временную директорию (в подпапку пользователя)."""
         ext = Path(document.file_name).suffix.lower()
         if ext not in self.ALLOWED_EXTENSIONS:
@@ -53,7 +53,6 @@ class FileService:
         if bot:
             await bot.download(file=document.file_id, destination=save_path)
         else:
-            from aiogram import Bot
             # Fallback — не должно произойти, но на всякий случай
             raise ValueError("Bot instance is required to download files")
 
@@ -188,7 +187,7 @@ class FileService:
     def _fast_csv_row_count(file_path: str) -> int:
         """Быстрый подсчёт строк в CSV (без загрузки всех данных в память)."""
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(file_path, encoding="utf-8", errors="ignore") as f:
                 return sum(1 for _ in f) - 1  # минус заголовок
         except Exception:
             return 0
@@ -251,7 +250,7 @@ class FileService:
                 dtypes = {c: str(df[c].dtype) for c in cols}
                 # ✅ Быстрый подсчёт строк (без загрузки всего файла)
                 row_count = self._fast_csv_row_count(file_path)
-                summary.append(f"📊 CSV файл")
+                summary.append("📊 CSV файл")
                 summary.append(f"   Колонки ({len(cols)}): `{', '.join(cols)}`")
                 summary.append(f"   Типы: `{dtypes}`")
                 summary.append(f"   Строк (всего): {row_count}")
@@ -262,7 +261,7 @@ class FileService:
                     doc = DocxDocument(file_path)
                     paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
                     tables = doc.tables
-                    summary.append(f"📝 Word документ")
+                    summary.append("📝 Word документ")
                     summary.append(f"   Абзацев: {len(paragraphs)}")
                     summary.append(f"   Таблиц: {len(tables)}")
                     if paragraphs:
@@ -292,10 +291,10 @@ class FileService:
 
             elif ext == ".txt":
                 try:
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    with open(file_path, encoding="utf-8", errors="ignore") as f:
                         lines = f.readlines()
                     total_lines = len(lines)
-                    summary.append(f"📃 Текстовый файл")
+                    summary.append("📃 Текстовый файл")
                     summary.append(f"   Строк: {total_lines}")
                     summary.append(f"   Символов: {sum(len(l) for l in lines)}")
                     # Первые строки

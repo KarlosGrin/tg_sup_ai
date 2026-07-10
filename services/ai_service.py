@@ -6,9 +6,9 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Optional
 
 import tenacity
+
 from config import config
 from utils.profiler_decorator import profiled
 
@@ -126,7 +126,7 @@ class AIService:
             raise ValueError("Gemini returned empty response")
         return text
 
-    def _call_gemini(self, prompt: str, json_mode: bool = True) -> Optional[str]:
+    def _call_gemini(self, prompt: str, json_mode: bool = True) -> str | None:
         """Вызов Gemini API + retry + fallback для не-retryable ошибок."""
         try:
             return self._call_gemini_retried(prompt, json_mode=json_mode)
@@ -157,7 +157,7 @@ class AIService:
             raise ValueError("OpenAI returned empty response")
         return content
 
-    def _call_openai(self, prompt: str, json_mode: bool = True) -> Optional[str]:
+    def _call_openai(self, prompt: str, json_mode: bool = True) -> str | None:
         """Вызов OpenAI API + retry + fallback для не-retryable ошибок."""
         try:
             return self._call_openai_retried(prompt, json_mode=json_mode)
@@ -172,7 +172,7 @@ class AIService:
         file_summaries: list[str],
         input_path: str,
         output_path: str,
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """
         Отправить запрос AI и получить сгенерированный код.
 
@@ -237,9 +237,17 @@ class AIService:
         except Exception as e:
             return f"❌ Ошибка при обращении к AI: {e}"
 
-    def _parse_response(self, content: str) -> Optional[dict]:
+    # Максимальный размер ответа AI для парсинга (защита от OOM)
+    _MAX_PARSE_SIZE = 200_000  # 200 КБ
+
+    def _parse_response(self, content: str) -> dict | None:
         """Извлечь JSON из ответа AI."""
         content = content.strip()
+
+        # Защита от OOM: AI может вернуть гигантский JSON (например, код > 100 КБ)
+        if len(content) > self._MAX_PARSE_SIZE:
+            logger.warning("Ответ AI слишком большой: %d байт (макс %d)", len(content), self._MAX_PARSE_SIZE)
+            return None
 
         # Пытаемся найти JSON в markdown-блоке
         json_match = re.search(r"```(?:json)?\s*\n(.*?)\n```", content, re.DOTALL)

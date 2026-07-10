@@ -10,15 +10,15 @@ Gemini читает файл через File API и генерирует Python-
 """
 
 import asyncio
+import json
 import logging
 import os
-import json
-import tempfile
 import re
+import tempfile
 from pathlib import Path
-from typing import Optional
 
 import tenacity
+
 from config import config
 from utils.profiler_decorator import profiled
 
@@ -104,9 +104,11 @@ class GeminiAssistant:
             result["stderr"] = ""
 
             # 4. Выполняем код ЛОКАЛЬНО (не в песочнице Gemini)
+            #    ⚠️ Оборачиваем в asyncio.to_thread — code_executor.execute() синхронный
             if code_text:
                 from services.code_executor import code_executor
-                exec_result = code_executor.execute(
+                exec_result = await asyncio.to_thread(
+                    code_executor.execute,
                     code=code_text,
                     input_path=input_path,
                     output_path=output_path,
@@ -130,7 +132,7 @@ class GeminiAssistant:
     async def _generate_code(
         self, file_name: str, file_uri: str, input_path: str, output_path: str,
         user_command: str = "",
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Отправить файл (через URI) в Gemini и получить сгенерированный код."""
         prompt = self._build_prompt(file_name, file_uri, input_path, output_path, user_command)
 
@@ -181,7 +183,7 @@ class GeminiAssistant:
     # Upload / File API
     # ----------------------------------------------------------------
 
-    async def _upload_file(self, file_path: str) -> Optional[str]:
+    async def _upload_file(self, file_path: str) -> str | None:
         """Загрузить файл в Gemini File API (async), вернуть URI."""
         try:
             file_path_resolved = str(Path(file_path).resolve())
@@ -269,10 +271,19 @@ class GeminiAssistant:
 ## Формат ответа
 {{"analysis": "что будет сделано", "code": "Python код", "explanation": "пояснение"}}"""
 
+    # Максимальный размер ответа AI для парсинга (защита от OOM)
+    _MAX_PARSE_SIZE = 200_000  # 200 КБ
+
     @staticmethod
-    def _parse_response(content: str) -> Optional[dict]:
+    def _parse_response(content: str) -> dict | None:
         """Извлечь JSON из ответа AI."""
         content = content.strip()
+
+        # Защита от OOM: AI может вернуть гигантский JSON
+        if len(content) > GeminiAssistant._MAX_PARSE_SIZE:
+            logger.warning("Ответ Gemini слишком большой: %d байт (макс %d)",
+                           len(content), GeminiAssistant._MAX_PARSE_SIZE)
+            return None
 
         json_match = re.search(r"```(?:json)?\s*\n(.*?)\n```", content, re.DOTALL)
         if json_match:
@@ -301,7 +312,7 @@ class GeminiAssistant:
     # Вспомогательные
     # ----------------------------------------------------------------
 
-    def _make_ascii_copy(self, file_path: str) -> Optional[str]:
+    def _make_ascii_copy(self, file_path: str) -> str | None:
         """Создать ASCII-safe копию файла."""
         try:
             src = Path(file_path)

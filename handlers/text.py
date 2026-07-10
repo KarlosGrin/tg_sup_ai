@@ -11,9 +11,9 @@ from config import config
 from handlers.common import (
     _check_rate_limit,
     _get_session,
-    _process_action,
     _user_request_times,
 )
+from services.pipeline import process_action
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ async def handle_text(message: Message):
         await message.answer(f"⏳ Слишком много запросов. Лимит: {config.RATE_LIMIT_REQUESTS_PER_MIN} в минуту.")
         return
 
-    await _process_action(message, user_id, command, require_confirm=True)
+    await process_action(message, user_id, command, require_confirm=True)
 
 
 @router.message()

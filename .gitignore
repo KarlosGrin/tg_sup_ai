@@ -38,5 +38,10 @@ downloads/
 processed/
 *.log
 
+# Профилирование
+profile.stats
+profiles/
+profiling.py
+
 # Docker (опционально, если собираете образ локально)
 .sandbox-cache/

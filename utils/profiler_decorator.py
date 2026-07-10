@@ -16,9 +16,8 @@
 
 import cProfile
 import functools
-import pstats
 import logging
-import os
+import pstats
 from pathlib import Path
 
 from config import config
@@ -137,7 +136,7 @@ def start_yappi(output_dir: str | Path | None = None):
     def stop():
         yappi.stop()
         stats = yappi.get_func_stats()
-        prof_file = output_path / f"async_profile.pstat"
+        prof_file = output_path / "async_profile.pstat"
         stats.save(str(prof_file), type="pstat")
         logger.info("📊 Async-профиль сохранён: %s", prof_file)
 

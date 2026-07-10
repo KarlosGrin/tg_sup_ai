@@ -23,11 +23,11 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
 from config import config
-from handlers.common import _cleanup_stale_entries
-from handlers.commands import router as commands_router
 from handlers.admin import router as admin_router
-from handlers.documents import router as documents_router
 from handlers.callbacks import router as callbacks_router
+from handlers.commands import router as commands_router
+from handlers.common import _cleanup_stale_entries
+from handlers.documents import router as documents_router
 from handlers.text import router as text_router
 from services.file_service import file_service
 from services.profiler import ProfilingMiddleware
@@ -73,6 +73,15 @@ async def on_startup(bot: Bot):
         logger.info("📊 Async-профилирование ВКЛЮЧЕНО (yappi)")
     else:
         _stop_yappi = lambda: None
+
+    # Проверка принудительного Docker для production
+    if config.ENFORCE_DOCKER and not config.DOCKER_ENABLED:
+        logger.error("⚠️" + "=" * 60)
+        logger.error("⚠️ ENFORCE_DOCKER=true, но DOCKER_ENABLED=false!")
+        logger.error("⚠️ Бот не может запуститься в production-режиме без Docker.")
+        logger.error("⚠️ Установите Docker Desktop и выполните: docker compose build sandbox")
+        logger.error("⚠️" + "=" * 60)
+        raise RuntimeError("ENFORCE_DOCKER is set but Docker is not enabled. Aborting.")
 
     # Предупреждение о режиме песочницы
     if not config.DOCKER_ENABLED:

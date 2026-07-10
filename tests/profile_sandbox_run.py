@@ -6,7 +6,6 @@
     ENABLE_PROFILING=true python -m tests.profile_sandbox_run
 """
 
-import os
 import sys
 import textwrap
 from pathlib import Path
@@ -44,7 +43,7 @@ def main():
     # 2. Профилируем get_file_summary (горячий кэш)
     print("📊 Profile: get_file_summary (cached)...")
     summary2 = file_service.get_file_summary(str(xlsx_path))
-    print(f"   OK (cached)")
+    print("   OK (cached)")
 
     # 3. Профилируем code_executor.execute
     code = textwrap.dedent("""\

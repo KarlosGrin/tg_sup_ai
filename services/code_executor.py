@@ -9,291 +9,16 @@ import json
 import logging
 import subprocess
 import sys
-import textwrap
 import uuid
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
+from services.sandbox_bootstrap import _SANDBOX_BOOTSTRAP, _SANDBOX_BOOTSTRAP_FILE
+from utils.helpers import sanitize_log
 from utils.profiler_decorator import profiled
 
 logger = logging.getLogger(__name__)
-
-
-# ══════════════════════════════════════════════════════════════════
-# Sandbox-обёртка — запускается в отдельном процессе через subprocess
-# (читает конфиг из stdin: первая строка — JSON)
-# ══════════════════════════════════════════════════════════════════
-_SANDBOX_BOOTSTRAP = textwrap.dedent("""\
-    import sys, json, pathlib, traceback
-    from io import StringIO
-
-    # 1. Читаем конфиг из stdin (первая строка — JSON)
-    config_line = sys.stdin.readline()
-    cfg = json.loads(config_line)
-
-    download_dir = cfg["download_dir"]
-    processed_dir = cfg["processed_dir"]
-    input_path = cfg["input_path"]
-    output_path = cfg["output_path"]
-    output_dir = cfg["output_dir"]
-
-    # 2. Импорт разрешённых модулей (ДО ограничения builtins — нужен __import__)
-    import pandas as pd
-    import numpy as np
-    import re, datetime, math, collections, itertools, statistics, copy
-    import json as _json_mod
-
-    # 3. Белый список модулей, которые можно импортировать из пользовательского кода
-    # ⚠️ Никогда не добавляйте сюда "os", "subprocess", "shutil", "socket" и т.д.
-    _ALLOWED_IMPORTS = {
-        "pandas", "numpy", "openpyxl", "docx", "xlwt", "odf",
-        "re", "datetime", "math", "collections", "itertools", "statistics", "copy",
-        "json", "pathlib", "io", "typing",
-        "xml", "xml.etree", "xml.etree.ElementTree",
-    }
-
-    _real_import = __import__
-    def _safe_import(name, *args, **kwargs):
-        # Прямое совпадение
-        if name in _ALLOWED_IMPORTS:
-            return _real_import(name, *args, **kwargs)
-        # Субмодули разрешённых модулей (openpyxl.styles, xml.etree.ElementTree и т.д.)
-        for allowed in _ALLOWED_IMPORTS:
-            if name.startswith(allowed + "."):
-                return _real_import(name, *args, **kwargs)
-        raise ImportError(f"⛔ Импорт модуля '{name}' запрещён по соображениям безопасности")
-
-    # 4. Ограниченные builtins (с безопасным __import__ и open)
-    safe_builtins = {
-        "True": True, "False": False, "None": None,
-        "Ellipsis": Ellipsis, "NotImplemented": NotImplemented,
-        "bool": bool, "int": int, "float": float, "complex": complex,
-        "str": str, "bytes": bytes, "bytearray": bytearray,
-        "list": list, "dict": dict, "tuple": tuple, "set": set, "frozenset": frozenset,
-        "object": object, "type": type, "slice": slice,
-        "range": range, "enumerate": enumerate, "zip": zip,
-        "map": map, "filter": filter, "reversed": reversed, "sorted": sorted,
-        "iter": iter, "next": next,
-        "len": len, "min": min, "max": max, "sum": sum, "any": any, "all": all,
-        "abs": abs, "round": round, "pow": pow, "divmod": divmod,
-        "ord": ord, "chr": chr, "repr": repr, "ascii": ascii, "format": format,
-        "hash": hash, "id": id,
-        "isinstance": isinstance, "issubclass": issubclass,
-        "hasattr": hasattr, "getattr": getattr, "setattr": setattr, "delattr": delattr,
-        "callable": callable,
-        "staticmethod": staticmethod, "classmethod": classmethod,
-        "property": property, "super": super,
-        "print": print,
-        "Exception": Exception, "BaseException": BaseException,
-        "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
-        "IndexError": IndexError, "AttributeError": AttributeError,
-        "StopIteration": StopIteration, "RuntimeError": RuntimeError,
-        "FileNotFoundError": FileNotFoundError, "OSError": OSError,
-        "IOError": IOError, "ZeroDivisionError": ZeroDivisionError,
-        "AssertionError": AssertionError, "ImportError": ImportError,
-        "NotImplementedError": NotImplementedError, "NameError": NameError,
-        "SyntaxError": SyntaxError, "IndentationError": IndentationError,
-        "KeyboardInterrupt": KeyboardInterrupt, "SystemExit": SystemExit,
-        "MemoryError": MemoryError, "RecursionError": RecursionError,
-        "OverflowError": OverflowError, "ArithmeticError": ArithmeticError,
-        "LookupError": LookupError,
-        "__import__": _safe_import,
-    }
-
-    # 5. Безопасный open() — только в разрешённые директории
-    ALLOWED_DIRS = [download_dir, processed_dir]
-    _real_open = open
-    def _safe_open(file, mode="r", *args, **kwargs):
-        try:
-            resolved = str(pathlib.Path(file).resolve())
-        except Exception:
-            raise PermissionError(f"Access denied: invalid path '{file}'")
-        for d in ALLOWED_DIRS:
-            if resolved.startswith(d):
-                return _real_open(file, mode, *args, **kwargs)
-        raise PermissionError(f"Access denied: '{file}' not in allowed directories")
-
-    safe_builtins["open"] = _safe_open
-
-    # 6. Формируем namespace
-    namespace = {
-        "__builtins__": safe_builtins,
-        "pd": pd, "pandas": pd, "np": np, "numpy": np,
-        "input_path": input_path,
-        "output_path": output_path,
-        "output_dir": output_dir,
-        "re": re, "datetime": datetime, "math": math,
-        "collections": collections, "itertools": itertools,
-        "statistics": statistics, "copy": copy,
-    }
-
-    # Пробуем импортировать опциональные модули
-    for mod_name in ("openpyxl", "docx", "xlwt", "odf"):
-        try:
-            namespace[mod_name] = __import__(mod_name)
-        except ImportError:
-            pass
-
-    # 7. Читаем и выполняем код
-    code_lines = sys.stdin.read()
-    redirected_out = StringIO()
-    redirected_err = StringIO()
-    old_out, old_err = sys.stdout, sys.stderr
-
-    try:
-        sys.stdout = redirected_out
-        sys.stderr = redirected_err
-        exec(code_lines, namespace)
-        print("__EXIT_SUCCESS__", flush=True)
-    except Exception:
-        traceback.print_exc(file=redirected_err)
-        print("__EXIT_FAILURE__", flush=True)
-    finally:
-        sys.stdout = old_out
-        sys.stderr = old_err
-        # Выводим captured output
-        sys.stdout.write(redirected_out.getvalue())
-        sys.stderr.write(redirected_err.getvalue())
-""")
-
-# ══════════════════════════════════════════════════════════════════
-# Sandbox-обёртка ДЛЯ DOCKER — читает скрипт из файла (sys.argv[1]).
-# Файл содержит: строка 1 = JSON-конфиг, остальное = код пользователя.
-# ══════════════════════════════════════════════════════════════════
-_SANDBOX_BOOTSTRAP_FILE = textwrap.dedent("""\
-    import sys, json, pathlib, traceback
-    from io import StringIO
-
-    # 1. Читаем конфиг из первой строки файла (путь в sys.argv[1])
-    script_path = sys.argv[1]
-    with open(script_path, "r") as _sf:
-        config_line = _sf.readline().strip()
-    cfg = json.loads(config_line)
-
-    download_dir = cfg["download_dir"]
-    processed_dir = cfg["processed_dir"]
-    input_path = cfg["input_path"]
-    output_path = cfg["output_path"]
-    output_dir = cfg["output_dir"]
-
-    # 2. Импорт разрешённых модулей (ДО ограничения builtins — нужен __import__)
-    import pandas as pd
-    import numpy as np
-    import re, datetime, math, collections, itertools, statistics, copy
-    import json as _json_mod
-
-    # 3. Белый список модулей
-    _ALLOWED_IMPORTS = {
-        "pandas", "numpy", "openpyxl", "docx", "xlwt", "odf",
-        "re", "datetime", "math", "collections", "itertools", "statistics", "copy",
-        "json", "pathlib", "io", "typing",
-        "xml", "xml.etree", "xml.etree.ElementTree",
-    }
-
-    _real_import = __import__
-    def _safe_import(name, *args, **kwargs):
-        if name in _ALLOWED_IMPORTS:
-            return _real_import(name, *args, **kwargs)
-        for allowed in _ALLOWED_IMPORTS:
-            if name.startswith(allowed + "."):
-                return _real_import(name, *args, **kwargs)
-        raise ImportError(f"⛔ Импорт модуля '{name}' запрещён")
-
-    # 4. Ограниченные builtins
-    safe_builtins = {
-        "True": True, "False": False, "None": None,
-        "Ellipsis": Ellipsis, "NotImplemented": NotImplemented,
-        "bool": bool, "int": int, "float": float, "complex": complex,
-        "str": str, "bytes": bytes, "bytearray": bytearray,
-        "list": list, "dict": dict, "tuple": tuple, "set": set, "frozenset": frozenset,
-        "object": object, "type": type, "slice": slice,
-        "range": range, "enumerate": enumerate, "zip": zip,
-        "map": map, "filter": filter, "reversed": reversed, "sorted": sorted,
-        "iter": iter, "next": next,
-        "len": len, "min": min, "max": max, "sum": sum, "any": any, "all": all,
-        "abs": abs, "round": round, "pow": pow, "divmod": divmod,
-        "ord": ord, "chr": chr, "repr": repr, "ascii": ascii, "format": format,
-        "hash": hash, "id": id,
-        "isinstance": isinstance, "issubclass": issubclass,
-        "hasattr": hasattr, "getattr": getattr, "setattr": setattr, "delattr": delattr,
-        "callable": callable,
-        "staticmethod": staticmethod, "classmethod": classmethod,
-        "property": property, "super": super,
-        "print": print,
-        "Exception": Exception, "BaseException": BaseException,
-        "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
-        "IndexError": IndexError, "AttributeError": AttributeError,
-        "StopIteration": StopIteration, "RuntimeError": RuntimeError,
-        "FileNotFoundError": FileNotFoundError, "OSError": OSError,
-        "IOError": IOError, "ZeroDivisionError": ZeroDivisionError,
-        "AssertionError": AssertionError, "ImportError": ImportError,
-        "NotImplementedError": NotImplementedError, "NameError": NameError,
-        "SyntaxError": SyntaxError, "IndentationError": IndentationError,
-        "KeyboardInterrupt": KeyboardInterrupt, "SystemExit": SystemExit,
-        "MemoryError": MemoryError, "RecursionError": RecursionError,
-        "OverflowError": OverflowError, "ArithmeticError": ArithmeticError,
-        "LookupError": LookupError,
-        "__import__": _safe_import,
-    }
-
-    # 5. Безопасный open()
-    ALLOWED_DIRS = [download_dir, processed_dir]
-    _real_open = open
-    def _safe_open(file, mode="r", *args, **kwargs):
-        try:
-            resolved = str(pathlib.Path(file).resolve())
-        except Exception:
-            raise PermissionError(f"Access denied: invalid path '{file}'")
-        for d in ALLOWED_DIRS:
-            if resolved.startswith(d):
-                return _real_open(file, mode, *args, **kwargs)
-        raise PermissionError(f"Access denied: '{file}' not in allowed directories")
-
-    safe_builtins["open"] = _safe_open
-
-    # 6. Формируем namespace
-    namespace = {
-        "__builtins__": safe_builtins,
-        "pd": pd, "pandas": pd, "np": np, "numpy": np,
-        "input_path": input_path,
-        "output_path": output_path,
-        "output_dir": output_dir,
-        "re": re, "datetime": datetime, "math": math,
-        "collections": collections, "itertools": itertools,
-        "statistics": statistics, "copy": copy,
-    }
-
-    for mod_name in ("openpyxl", "docx", "xlwt", "odf"):
-        try:
-            namespace[mod_name] = __import__(mod_name)
-        except ImportError:
-            pass
-
-    # 7. Читаем и выполняем код пользователя (всё после первой строки)
-    with open(script_path, "r") as _sf:
-        _sf.readline()  # пропускаем строку конфига
-        code_lines = _sf.read()
-
-    redirected_out = StringIO()
-    redirected_err = StringIO()
-    old_out, old_err = sys.stdout, sys.stderr
-
-    try:
-        sys.stdout = redirected_out
-        sys.stderr = redirected_err
-        exec(code_lines, namespace)
-        print("__EXIT_SUCCESS__", flush=True)
-    except Exception:
-        traceback.print_exc(file=redirected_err)
-        print("__EXIT_FAILURE__", flush=True)
-    finally:
-        sys.stdout = old_out
-        sys.stderr = old_err
-        sys.stdout.write(redirected_out.getvalue())
-        sys.stderr.write(redirected_err.getvalue())
-""")
 
 # Имя Docker-образа для sandbox-контейнера
 DOCKER_SANDBOX_IMAGE = "tg_sup_ai-sandbox:latest"
@@ -337,6 +62,10 @@ class CodeExecutor:
     # ✅ Whitelist разрешённых dunder-атрибутов.
     # Любой другой __attr__ блокируется на уровне AST
     # (это закрывает обходы через конкатенацию строк, getattr, __getattribute__).
+    # ⚠️ ВНИМАНИЕ: __class__ — единственный dunder в whitelist, через который
+    #    теоретически можно добраться до __bases__ и __subclasses__().
+    #    Он разрешён только для легитимного кода (obj.__class__.__name__).
+    #    НЕ добавляйте __bases__, __mro__, __subclasses__ в этот whitelist.
     _ALLOWED_DUNDERS = frozenset({
         "__class__", "__name__", "__dict__", "__init__",
         "__str__", "__repr__", "__len__", "__iter__",
@@ -359,7 +88,7 @@ class CodeExecutor:
         """Проверить, является ли имя dunder-атрибутом (__xxx__)."""
         return name.startswith("__") and name.endswith("__") and len(name) > 4
 
-    def _check_code_ast(self, code: str) -> Optional[str]:
+    def _check_code_ast(self, code: str) -> str | None:
         """
         AST-анализ кода с whitelist-подходом (один проход вместо четырёх).
         - Блокирует ЛЮБОЙ dunder-атрибут (__xxx__), кроме _ALLOWED_DUNDERS
@@ -395,7 +124,9 @@ class CodeExecutor:
                 if self._is_dunder(node.attr) and node.attr not in self._ALLOWED_DUNDERS:
                     return f"⛔ AST: запрещён доступ к атрибуту '{node.attr}'"
 
-            # 3. getattr(obj, ...)
+            # 3. getattr(obj, ...) — блокируем ВСЕ случаи, даже с разрешёнными dunder
+            #    (getattr в safe_builtins удалён, но на уровне AST перехватываем на случай
+            #     будущих изменений — defence in depth)
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                     and node.func.id == "getattr" and len(node.args) >= 2):
                 arg = node.args[1]
@@ -404,8 +135,13 @@ class CodeExecutor:
                     val = arg.value
                 elif isinstance(arg, ast.Name) and arg.id in const_map:
                     val = const_map[arg.id]
-                if val and self._is_dunder(val) and val not in self._ALLOWED_DUNDERS:
-                    return f"⛔ AST: getattr() с запрещённым dunder '{val}'"
+                # Блокируем ЛЮБОЙ getattr с dunder (включая разрешённые — defense in depth)
+                if val and self._is_dunder(val):
+                    return f"⛔ AST: getattr() с dunder-атрибутом '{val}'"
+                # Также блокируем getattr, даже если второй аргумент — не-строковый
+                # (перехват динамических вызовов, не ловимых constant propagation)
+                if not isinstance(arg, (ast.Constant, ast.Name)):
+                    return "⛔ AST: getattr() с динамическим именем атрибута"
 
             # 4. obj.__getattribute__('...')
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -421,7 +157,7 @@ class CodeExecutor:
 
         return None
 
-    def _check_blocked_patterns(self, code: str) -> Optional[str]:
+    def _check_blocked_patterns(self, code: str) -> str | None:
         """Проверить код на опасные паттерны. Вернуть сообщение об ошибке или None.
 
         Использует два слоя защиты:
@@ -539,7 +275,7 @@ class CodeExecutor:
             input_data = config_json + "\n" + code
             stdout_raw, stderr_raw = proc.communicate(input=input_data, timeout=self._execution_timeout)
             logger.info("stdout (%d chars)", len(stdout_raw))
-            logger.info("stderr (%d chars): %s", len(stderr_raw), stderr_raw[:500])
+            logger.info("stderr (%d chars): %s", len(stderr_raw), sanitize_log(stderr_raw[:500]))
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_raw, stderr_raw = proc.communicate()
@@ -586,13 +322,10 @@ class CodeExecutor:
         output_path = result["output_path"]
 
         logger.info("Режим: Docker-контейнер (%s)", DOCKER_SANDBOX_IMAGE)
-        logger.info("input=%s", input_path_abs)
-        logger.info("output=%s", output_path_abs)
+        logger.info("input=%s", sanitize_log(input_path_abs))
+        logger.info("output=%s", sanitize_log(output_path_abs))
 
         # Конвертируем Windows-пути в Linux-пути внутри контейнера
-        # Теперь файлы лежат в user-подпапках: downloads/<user_id>/file, processed/<user_id>/file
-        # Вычисляем относительный путь от базовой директории
-        # ⚠️ Path.relative_to() на Windows возвращает пути с \, заменяем на /
         try:
             input_rel = str(Path(input_path_abs).relative_to(self._download_dir)).replace("\\", "/")
         except ValueError:
@@ -637,9 +370,6 @@ class CodeExecutor:
         )
         logger.info("script_host=%s", script_host)
 
-        # docker run ... image -c "BOOTSTRAP" /data/processed/_sandbox_X.py
-        # ENTRYPOINT ["python"] подставится автоматически:
-        # → python -c "BOOTSTRAP" /data/processed/_sandbox_X.py
         docker_cmd = ["docker", "run"] + DOCKER_RUN_ARGS + [
             "-v", f"{self._download_dir}:{CONTAINER_MOUNT}/downloads:ro",
             "-v", f"{self._processed_dir}:{CONTAINER_MOUNT}/processed",
@@ -655,12 +385,11 @@ class CodeExecutor:
                 stderr=subprocess.PIPE,
             )
 
-            # stdind не используется — всё через файл
             stdout_raw_bytes, stderr_raw_bytes = proc.communicate(timeout=self._execution_timeout)
             stdout_raw = stdout_raw_bytes.decode("utf-8", errors="replace")
             stderr_raw = stderr_raw_bytes.decode("utf-8", errors="replace")
             logger.info("Docker stdout (%d chars)", len(stdout_raw))
-            logger.info("Docker stderr (%d chars): %s", len(stderr_raw), stderr_raw[:500])
+            logger.info("Docker stderr (%d chars): %s", len(stderr_raw), sanitize_log(stderr_raw[:500]))
 
         except FileNotFoundError:
             result["stderr"] = "❌ Docker не найден. Установите Docker Desktop или отключите DOCKER_ENABLED в .env"
@@ -691,8 +420,7 @@ class CodeExecutor:
         else:
             result = self._parse_result(result, clean_stdout, stderr_combined.strip() or "Контейнер завершился нештатно.", success=False)
 
-        # Проверяем output-файл (создан внутри контейнера по /data/processed/..., 
-        # но на хосте виден как Windows-путь)
+        # Проверяем output-файл
         if Path(output_path).exists():
             logger.info("✅ Docker: файл создан: %s", output_path)
         else:

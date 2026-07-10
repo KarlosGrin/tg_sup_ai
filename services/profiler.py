@@ -5,8 +5,8 @@
 """
 
 import logging
-import time
 import statistics
+import time
 from collections import defaultdict
 
 from aiogram import BaseMiddleware

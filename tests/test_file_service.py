@@ -2,10 +2,10 @@
 Unit-тесты для FileService (без Telegram, без сети).
 """
 
-import pytest
-import uuid
-from pathlib import Path
 import sys
+from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -132,7 +132,7 @@ class TestFileSummary:
         """Текстовый файл должен давать корректное описание."""
         f = tmp_path / "test.txt"
         f.write_text("Hello\nWorld\nLine 3\n")
-        summary = FileService.get_file_summary(str(f))
+        summary = file_service.get_file_summary(str(f))
         assert "test.txt" in summary
         assert "Текстовый файл" in summary
 
@@ -140,7 +140,7 @@ class TestFileSummary:
         """CSV файл должен показывать колонки."""
         f = tmp_path / "test.csv"
         f.write_text("name,age,city\nAlice,30,NYC\nBob,25,LA\n")
-        summary = FileService.get_file_summary(str(f))
+        summary = file_service.get_file_summary(str(f))
         assert "test.csv" in summary
         assert "name" in summary
         assert "age" in summary

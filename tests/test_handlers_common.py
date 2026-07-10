@@ -3,20 +3,25 @@ Unit-тесты для хелперов из handlers/common.py.
 """
 
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from handlers.common import (
-    _check_rate_limit, _detect_target_extension,
-    _cleanup_stale_entries, _track_user, _known_users,
-    _user_request_times, _user_upload_times, user_sessions,
-    _get_session, _is_admin,
-)
 from config import config
+from handlers.common import (
+    _check_rate_limit,
+    _cleanup_stale_entries,
+    _get_session,
+    _is_admin,
+    _known_users,
+    _track_user,
+    _user_request_times,
+    _user_upload_times,
+    user_sessions,
+)
+from services.pipeline import _detect_target_extension
 
 
 @pytest.fixture(autouse=True)

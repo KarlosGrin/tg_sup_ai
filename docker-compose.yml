@@ -31,5 +31,11 @@ services:
       - ./downloads:/app/downloads
       - ./processed:/app/processed
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python main.py' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     # sandbox-образ собирается отдельно: docker compose --profile donotstart build sandbox
     # (сервис bot не зависит от запущенного sandbox-контейнера)
