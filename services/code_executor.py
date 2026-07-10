@@ -357,27 +357,11 @@ class CodeExecutor:
         """Проверить, является ли имя dunder-атрибутом (__xxx__)."""
         return name.startswith("__") and name.endswith("__") and len(name) > 4
 
-    @staticmethod
-    def _constant_propagate(tree: ast.AST) -> dict[str, str]:
-        """
-        Простой constant propagation: собирает присваивания вида
-            var = 'строка'
-        и возвращает словарь {имя_переменной: значение}.
-        """
-        const_map: dict[str, str] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                    var_name = node.targets[0].id
-                    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                        const_map[var_name] = node.value.value
-        return const_map
-
     def _check_code_ast(self, code: str) -> Optional[str]:
         """
-        AST-анализ кода с whitelist-подходом:
+        AST-анализ кода с whitelist-подходом (один проход вместо четырёх).
         - Блокирует ЛЮБОЙ dunder-атрибут (__xxx__), кроме _ALLOWED_DUNDERS
-        - Сканирует все строковые константы и атрибуты
+        - Сканирует строковые константы, атрибуты, getattr, __getattribute__
         - Использует constant propagation для отслеживания значений переменных
         """
         try:
@@ -385,51 +369,53 @@ class CodeExecutor:
         except SyntaxError:
             return None
 
-        const_map = self._constant_propagate(tree)
+        const_map: dict[str, str] = {}
+        import re as _re
 
-        # 1. Сканируем ВСЕ строковые константы на dunder-паттерны
-        #    (ловит '.__subcla' 'sses__' → единый Constant('__subclasses__'))
+        # Единый проход: constant propagation + все проверки за 1 walk()
         for node in ast.walk(tree):
+            # Constant propagation: var = 'строка'
+            if isinstance(node, ast.Assign):
+                if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                        and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, str)):
+                    const_map[node.targets[0].id] = node.value.value
+
+            # 1. Строковые константы: dunder-паттерны
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                val = node.value
-                # Ищем любой dunder-паттерн в строке
-                import re
-                for match in re.finditer(r'__[a-zA-Z_]\w+__', val):
+                for match in _re.finditer(r'__[a-zA-Z_]\w+__', node.value):
                     dunder = match.group()
                     if self._is_dunder(dunder) and dunder not in self._ALLOWED_DUNDERS:
                         return f"⛔ AST: строковая константа содержит запрещённый dunder '{dunder}'"
 
-        # 2. Сканируем все атрибуты (obj.__xxx__)
-        for node in ast.walk(tree):
+            # 2. Атрибуты obj.__xxx__
             if isinstance(node, ast.Attribute):
                 if self._is_dunder(node.attr) and node.attr not in self._ALLOWED_DUNDERS:
                     return f"⛔ AST: запрещён доступ к атрибуту '{node.attr}'"
 
-        # 3. Сканируем getattr(obj, ...) — с constant propagation
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
-                if len(node.args) >= 2:
-                    arg = node.args[1]
-                    val = None
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        val = arg.value
-                    elif isinstance(arg, ast.Name) and arg.id in const_map:
-                        val = const_map[arg.id]
-                    if val and self._is_dunder(val) and val not in self._ALLOWED_DUNDERS:
-                        return f"⛔ AST: getattr() с запрещённым dunder '{val}'"
+            # 3. getattr(obj, ...)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr" and len(node.args) >= 2):
+                arg = node.args[1]
+                val = None
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    val = arg.value
+                elif isinstance(arg, ast.Name) and arg.id in const_map:
+                    val = const_map[arg.id]
+                if val and self._is_dunder(val) and val not in self._ALLOWED_DUNDERS:
+                    return f"⛔ AST: getattr() с запрещённым dunder '{val}'"
 
-        # 4. Сканируем obj.__getattribute__('...')
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "__getattribute__":
-                if len(node.args) >= 1:
-                    arg = node.args[0]
-                    val = None
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        val = arg.value
-                    elif isinstance(arg, ast.Name) and arg.id in const_map:
-                        val = const_map[arg.id]
-                    if val and self._is_dunder(val) and val not in self._ALLOWED_DUNDERS:
-                        return f"⛔ AST: __getattribute__() с запрещённым dunder '{val}'"
+            # 4. obj.__getattribute__('...')
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__getattribute__" and len(node.args) >= 1):
+                arg = node.args[0]
+                val = None
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    val = arg.value
+                elif isinstance(arg, ast.Name) and arg.id in const_map:
+                    val = const_map[arg.id]
+                if val and self._is_dunder(val) and val not in self._ALLOWED_DUNDERS:
+                    return f"⛔ AST: __getattribute__() с запрещённым dunder '{val}'"
 
         return None
 

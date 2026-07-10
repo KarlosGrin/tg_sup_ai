@@ -3,6 +3,7 @@
 """
 
 import os
+import time
 import uuid
 import shutil
 from pathlib import Path
@@ -20,6 +21,10 @@ class FileService:
         ".docx", ".doc",
         ".txt", ".json", ".xml",
     }
+
+    # Кэш summaries: path -> (timestamp, summary)
+    _summary_cache: dict[str, tuple[float, str]] = {}
+    _SUMMARY_CACHE_TTL = 300  # 5 минут
 
     def __init__(self):
         self.download_dir = Path(config.DOWNLOAD_DIR)
@@ -102,10 +107,17 @@ class FileService:
                     os.remove(p)
                 except OSError:
                     pass
+        # Инвалидируем кэш для файлов этого пользователя
+        user_prefixes = [
+            str(self.download_dir / str(user_id)),
+            str(self.processed_dir / str(user_id)),
+        ]
+        for key in list(self._summary_cache):
+            if any(key.startswith(p) for p in user_prefixes):
+                self._summary_cache.pop(key, None)
 
     def cleanup_old_files(self, max_age_hours: int = 24):
         """Очистка всех временных файлов старше N часов (рекурсивно по подпапкам пользователей)."""
-        import time
         now = time.time()
         for directory in [self.download_dir, self.processed_dir]:
             # Чистим файлы рекурсивно (в т.ч. в user-подпапках)
@@ -173,11 +185,41 @@ class FileService:
         return text
 
     @staticmethod
-    def get_file_summary(file_path: str) -> str:
+    def _fast_csv_row_count(file_path: str) -> int:
+        """Быстрый подсчёт строк в CSV (без загрузки всех данных в память)."""
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return sum(1 for _ in f) - 1  # минус заголовок
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _get_excel_row_count(file_path: str, sheet_name: str) -> int:
+        """Быстрый подсчёт строк в Excel-листе через openpyxl (без pandas)."""
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(file_path, read_only=True)
+            ws = wb[sheet_name]
+            return ws.max_row or 0
+        except Exception:
+            # fallback: только одна колонка через pandas
+            try:
+                import pandas as pd
+                return len(pd.read_excel(file_path, sheet_name=sheet_name, usecols=[0]))
+            except Exception:
+                return 0
+
+    def get_file_summary(self, file_path: str) -> str:
         """
         Получить краткое описание файла: формат, размер, базовую структуру.
-        Возвращает текстовое описание для передачи AI.
+        Результат кэшируется на 5 минут.
         """
+        # === Проверка кэша ===
+        now = time.time()
+        cached = self._summary_cache.get(file_path)
+        if cached and (now - cached[0]) < self._SUMMARY_CACHE_TTL:
+            return cached[1]
+
         path = Path(file_path)
         ext = path.suffix.lower()
         size_kb = path.stat().st_size / 1024
@@ -190,24 +232,29 @@ class FileService:
                 sheet_names = excel_file.sheet_names
                 summary.append(f"📑 Листы: `{', '.join(sheet_names)}`")
                 for sheet in sheet_names[:3]:  # Показываем первые 3 листа
+                    # ✅ Одно чтение: только 5 строк для структуры
                     df = pd.read_excel(file_path, sheet_name=sheet, nrows=5)
                     cols = list(df.columns)
                     dtypes = {c: str(df[c].dtype) for c in cols}
+                    # ✅ Быстрый подсчёт строк через openpyxl (без pandas)
+                    row_count = self._get_excel_row_count(file_path, sheet)
                     summary.append(f"\n  🔹 Лист «{sheet}»:")
                     summary.append(f"     Колонки ({len(cols)}): `{', '.join(cols)}`")
                     summary.append(f"     Типы: `{dtypes}`")
-                    summary.append(f"     Строк (всего): ~{len(pd.read_excel(file_path, sheet_name=sheet))}")
+                    summary.append(f"     Строк (всего): ~{row_count}")
 
             elif ext == ".csv":
                 import pandas as pd
+                # ✅ Одно чтение: только 5 строк для структуры
                 df = pd.read_csv(file_path, nrows=5, encoding="utf-8")
-                full_df = pd.read_csv(file_path, encoding="utf-8")
                 cols = list(df.columns)
                 dtypes = {c: str(df[c].dtype) for c in cols}
+                # ✅ Быстрый подсчёт строк (без загрузки всего файла)
+                row_count = self._fast_csv_row_count(file_path)
                 summary.append(f"📊 CSV файл")
                 summary.append(f"   Колонки ({len(cols)}): `{', '.join(cols)}`")
                 summary.append(f"   Типы: `{dtypes}`")
-                summary.append(f"   Строк (всего): {len(full_df)}")
+                summary.append(f"   Строк (всего): {row_count}")
 
             elif ext in (".docx", ".doc"):
                 try:
@@ -269,7 +316,10 @@ class FileService:
         except Exception as e:
             summary.append(f"⚠️ Ошибка чтения: {e}")
 
-        return "\n".join(summary)
+        result = "\n".join(summary)
+        # === Сохраняем в кэш ===
+        self._summary_cache[file_path] = (now, result)
+        return result
 
 
 file_service = FileService()

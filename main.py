@@ -30,6 +30,7 @@ from handlers.documents import router as documents_router
 from handlers.callbacks import router as callbacks_router
 from handlers.text import router as text_router
 from services.file_service import file_service
+from services.profiler import ProfilingMiddleware
 
 # Настройка логирования
 logging.basicConfig(
@@ -140,6 +141,10 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+
+    # Регистрируем профайлер (замеряет все хендлеры)
+    dp.message.middleware(ProfilingMiddleware())
+    dp.callback_query.middleware(ProfilingMiddleware())
 
     # Регистрируем роутеры (порядок важен: специфичные → общие)
     dp.include_router(commands_router)

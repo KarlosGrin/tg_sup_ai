@@ -16,6 +16,7 @@ from handlers.common import (
     _known_users,
     user_sessions,
 )
+from services.profiler import get_stats, reset_stats
 
 logger = logging.getLogger(__name__)
 
@@ -66,24 +67,68 @@ async def cmd_broadcast(message: Message):
 
     safe_text = html.escape(text)
 
-    sent = 0
-    errors = 0
-    for uid in list(_known_users):
-        try:
-            await message.bot.send_message(
-                chat_id=uid,
-                text=f"📢 <b>Сообщение от администратора:</b>\n\n{safe_text}",
-                parse_mode="HTML",
-            )
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            errors += 1
+    # ✅ Параллельная отправка с семафором (не больше 20 одновременных)
+    sem = asyncio.Semaphore(20)
+
+    async def _send_one(uid: int) -> bool:
+        async with sem:
+            try:
+                await message.bot.send_message(
+                    chat_id=uid,
+                    text=f"📢 <b>Сообщение от администратора:</b>\n\n{safe_text}",
+                    parse_mode="HTML",
+                )
+                return True
+            except Exception:
+                return False
+
+    results = await asyncio.gather(*[_send_one(uid) for uid in list(_known_users)])
+    sent = sum(1 for r in results if r)
+    errors = len(results) - sent
 
     await message.answer(
         f"✅ Сообщение отправлено <code>{sent}</code> пользователям. Ошибок: <code>{errors}</code>.",
         parse_mode="HTML",
     )
+
+
+@router.message(Command("perf"))
+async def cmd_perf(message: Message):
+    """Статистика производительности (только админ)."""
+    user_id = message.from_user.id
+    if not _is_admin(user_id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+
+    stats = get_stats()
+    if not stats:
+        await message.answer("📊 Нет данных производительности.")
+        return
+
+    lines = ["<b>📊 Производительность</b>\n"]
+    for label, metric in stats.items():
+        lines.append(
+            f"<code>{label}</code>\n"
+            f"  Вызовов: {metric['count']} | "
+            f"Среднее: {metric['mean']:.2f}с | "
+            f"Медиана: {metric['median']:.2f}с\n"
+            f"  Мин: {metric['min']:.2f}с | "
+            f"Макс: {metric['max']:.2f}с | "
+            f"P95: {metric['p95']:.2f}с\n"
+        )
+    lines.append("\n<code>/perf_reset</code> — сбросить статистику")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("perf_reset"))
+async def cmd_perf_reset(message: Message):
+    """Сбросить статистику производительности (только админ)."""
+    if not _is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав администратора.")
+        return
+    reset_stats()
+    await message.answer("✅ Статистика производительности сброшена.")
 
 
 @router.message(Command("stats"))
@@ -96,16 +141,13 @@ async def cmd_stats(message: Message):
 
     total_users = len(user_sessions)
     total_files = 0
-    total_history = 0
     for s in user_sessions.values():
         total_files += len(s.get("file_paths", []))
-        total_history += len(s.get("history", []))
 
     stats_text = (
         f"<b>📊 Статистика бота</b>\n\n"
         f"👥 Пользователей в сессиях: <code>{total_users}</code>\n"
         f"📎 Всего файлов: <code>{total_files}</code>\n"
-        f"💬 Сообщений в истории: <code>{total_history}</code>\n"
         f"⚙️ Провайдер: <code>{config.AI_PROVIDER}</code>\n"
         f"🔧 Режим exec: <code>{config.EXECUTION_MODE}</code>"
     )

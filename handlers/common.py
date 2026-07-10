@@ -15,6 +15,7 @@ from services.ai_service import ai_service
 from services.code_executor import code_executor
 from services.file_service import file_service
 from services.gemini_assistant import gemini_assistant
+from services.profiler import Timer
 from utils.helpers import sanitize_for_markdown
 
 logger = logging.getLogger(__name__)
@@ -53,20 +54,16 @@ def _is_admin(user_id: int) -> bool:
 def _cleanup_stale_entries():
     """Периодически чистит мёртвые записи rate-limit и сессий."""
     now = time.time()
+    # Итеративное удаление — без создания промежуточных списков
     for times_dict in (_user_request_times, _user_upload_times):
-        stale_uids = [
-            uid for uid, stamps in times_dict.items()
-            if not stamps or (now - max(stamps)) > 3600
-        ]
-        for uid in stale_uids:
-            del times_dict[uid]
-    stale_sessions = [
-        uid for uid, sess in user_sessions.items()
-        if not sess.get("file_paths") and not sess.get("last_code")
-        and uid not in _known_users
-    ]
-    for uid in stale_sessions:
-        del user_sessions[uid]
+        for uid in list(times_dict.keys()):
+            stamps = times_dict[uid]
+            if not stamps or (now - max(stamps)) > 3600:
+                del times_dict[uid]
+    for uid in list(user_sessions.keys()):
+        sess = user_sessions[uid]
+        if not sess.get("file_paths") and uid not in _known_users:
+            del user_sessions[uid]
 
 
 # === Сессии пользователей ===
@@ -80,7 +77,6 @@ def _get_session(user_id: int) -> dict:
         user_sessions[user_id] = {
             "file_paths": [],
             "last_code": "",
-            "history": [],
         }
     return user_sessions[user_id]
 
@@ -134,13 +130,14 @@ async def _process_ai_request(user_id: int, command: str, file_paths: list[str])
 
     try:
         async with asyncio.timeout(120):
-            result = await asyncio.to_thread(
-                ai_service.generate_code,
-                user_command=command,
-                file_summaries=list(file_summaries),
-                input_path=input_path,
-                output_path=output_path,
-            )
+            with Timer('ai.generate_code', log_slow=2.0):
+                result = await asyncio.to_thread(
+                    ai_service.generate_code,
+                    user_command=command,
+                    file_summaries=list(file_summaries),
+                    input_path=input_path,
+                    output_path=output_path,
+                )
     except TimeoutError:
         logger.warning("AI не ответил за 120 секунд")
         return None
@@ -172,14 +169,20 @@ async def _execute_code(code: str, output_path: str, input_path: str | None = No
         }
 
     if config.EXECUTION_MODE == "assistants":
-        execution_result = await gemini_assistant.execute(
-            code=code, input_path=input_path, output_path=output_path,
-            user_command=user_command,
-        )
+        with Timer('gemini.execute', log_slow=5.0):
+            execution_result = await gemini_assistant.execute(
+                code=code, input_path=input_path, output_path=output_path,
+                user_command=user_command,
+            )
     else:
-        execution_result = code_executor.execute(
-            code=code, input_path=input_path, output_path=output_path
-        )
+        # ✅ Асинхронный запуск — не блокирует event loop (subprocess может идти 120 с)
+        with Timer('code_executor.execute', log_slow=5.0):
+            execution_result = await asyncio.to_thread(
+                code_executor.execute,
+                code=code,
+                input_path=input_path,
+                output_path=output_path,
+            )
     return execution_result
 
 
