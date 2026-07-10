@@ -16,6 +16,8 @@ from typing import Optional
 
 import pandas as pd
 
+from utils.profiler_decorator import profiled
+
 logger = logging.getLogger(__name__)
 
 
@@ -438,6 +440,7 @@ class CodeExecutor:
         return None
 
     @staticmethod
+    @profiled()
     def _sanitize_code(code: str) -> str:
         """
         Постобработка AI-кода: удаляем хардкоженные пути и лишние импорты,
@@ -464,6 +467,7 @@ class CodeExecutor:
             cleaned.append(line)
         return "\n".join(cleaned)
 
+    @profiled()
     def execute(self, code: str, input_path: str, output_path: str) -> dict:
         """
         Выполнить Python-код в изолированном процессе (subprocess или Docker).

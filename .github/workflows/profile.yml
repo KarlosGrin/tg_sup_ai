@@ -1,0 +1,56 @@
+# Performance Profile - manual or PR trigger
+name: Performance Profile
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'services/code_executor.py'
+      - 'services/ai_service.py'
+      - 'services/gemini_assistant.py'
+      - 'services/file_service.py'
+      - 'utils/profiler_decorator.py'
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install snakeviz yappi
+
+      - name: Create mock files
+        run: |
+          mkdir -p profiles
+          python -c "import pandas as pd; pd.DataFrame({'A': range(1000), 'B': ['x']*1000}).to_excel('downloads/0/test.xlsx', index=False)"
+          python -c "import pandas as pd; pd.DataFrame({'A': range(1000), 'B': ['x']*1000}).to_csv('downloads/0/test.csv', index=False)"
+
+      - name: Run profiling suite
+        run: |
+          ENABLE_PROFILING=true python -m tests.profile_sandbox_run
+          ls -la profiles/
+
+      - name: Upload .prof artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-artifacts
+          path: profiles/*.prof
+          retention-days: 7
+
+      - name: Show summary
+        run: |
+          echo "## Profiles saved" >> $GITHUB_STEP_SUMMARY
+          ls -la profiles/ >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "snakeviz profiles/execute.prof" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

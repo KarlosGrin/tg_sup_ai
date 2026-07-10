@@ -31,6 +31,7 @@ from handlers.callbacks import router as callbacks_router
 from handlers.text import router as text_router
 from services.file_service import file_service
 from services.profiler import ProfilingMiddleware
+from utils.profiler_decorator import start_yappi
 
 # Настройка логирования
 logging.basicConfig(
@@ -42,6 +43,9 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+# placeholder для yappi stop (заполняется в on_startup)
+_stop_yappi = lambda: None
 
 
 async def on_startup(bot: Bot):
@@ -61,6 +65,14 @@ async def on_startup(bot: Bot):
     if config.AI_PROVIDER == "gemini" and not config.GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY не задан! Укажите его в .env файле.")
         raise ValueError("GEMINI_API_KEY is required")
+
+    # Запуск yappi-профайлера для async-кода (если ENABLE_PROFILING=true)
+    global _stop_yappi
+    if config.ENABLE_PROFILING:
+        _stop_yappi = start_yappi()
+        logger.info("📊 Async-профилирование ВКЛЮЧЕНО (yappi)")
+    else:
+        _stop_yappi = lambda: None
 
     # Предупреждение о режиме песочницы
     if not config.DOCKER_ENABLED:
@@ -118,6 +130,8 @@ async def _periodic_cleanup():
 async def on_shutdown(bot: Bot):
     """Действия при остановке бота."""
     logger.info("Бот останавливается...")
+    # Остановка yappi-профайлера (если был запущен)
+    _stop_yappi()
     # Очистка всех временных файлов
     file_service.cleanup_old_files(max_age_hours=0)
     logger.info("Временные файлы очищены.")

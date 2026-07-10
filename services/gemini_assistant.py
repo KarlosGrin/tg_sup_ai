@@ -20,6 +20,7 @@ from typing import Optional
 
 import tenacity
 from config import config
+from utils.profiler_decorator import profiled
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class GeminiAssistant:
         self._tmp_files: list[str] = []
         logger.info("Гибридный режим, модель: %s", self.model)
 
+    @profiled()
     async def execute(self, code: str, input_path: str, output_path: str, user_command: str = "") -> dict:
         """
         Загрузить файл в Gemini File API → Gemini генерирует код →

@@ -112,8 +112,10 @@ async def _process_ai_request(user_id: int, command: str, file_paths: list[str])
     primary_name = Path(primary_file).name
     parts = primary_name.split("_", 1)
     clean_name = parts[1] if len(parts) > 1 else primary_name
-    base, ext = os.path.splitext(clean_name)
-    output_name = f"{base}_result{ext}"
+    base, source_ext = os.path.splitext(clean_name)
+    # Определяем целевое расширение из команды пользователя
+    target_ext = _detect_target_extension(command, source_ext)
+    output_name = f"{base}_result{target_ext}"
     # Изоляция по user_id
     user_output_dir = Path(config.PROCESSED_DIR) / str(user_id)
     user_output_dir.mkdir(parents=True, exist_ok=True)

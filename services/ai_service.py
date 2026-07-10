@@ -10,6 +10,7 @@ from typing import Optional
 
 import tenacity
 from config import config
+from utils.profiler_decorator import profiled
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ class AIService:
     # Retry-обёртка: tenacity для сетевых ошибок/5xx/429
     # ═══════════════════════════════════════════════════════
 
+    @profiled()
     @tenacity.retry(
         stop=_AI_RETRY_CONFIG["stop"],
         wait=_AI_RETRY_CONFIG["wait"],
@@ -132,6 +134,7 @@ class AIService:
             logger.error("Gemini error: %s: %s", type(e).__name__, e)
             return None
 
+    @profiled()
     @tenacity.retry(
         stop=_AI_RETRY_CONFIG["stop"],
         wait=_AI_RETRY_CONFIG["wait"],
@@ -162,6 +165,7 @@ class AIService:
             logger.error("OpenAI error: %s: %s", type(e).__name__, e)
             return None
 
+    @profiled()
     def generate_code(
         self,
         user_command: str,
