@@ -200,7 +200,8 @@ class GeminiAssistant:
 
 ## Файл для обработки
 Файл '{file_name}' загружен в Gemini File API.
-Ты можешь прочитать его содержимое напрямую по URI: {file_uri}
+Ты используешь URI {file_uri} ТОЛЬКО для чтения содержимого своими глазами (через File API Gemini).
+НЕ включай этот URI в генерируемый Python-код.
 
 ## Команда пользователя
 {user_cmd}
@@ -221,16 +222,22 @@ class GeminiAssistant:
 
 НЕ ПИШИ: `input_path = "..."` или `output_path = "..."` — используй готовые переменные.
 НЕ ПИШИ: `import pandas as pd` — pd уже есть.
-НЕ ПИШИ: `import os` — модуль os НЕ ДОСТУПЕН по соображениям безопасности.
+НЕ ПИШИ: `import os` — модуль os НЕ ДОСТУПЕН.
+НЕ ИСПОЛЬЗУЙ: `requests`, `urllib`, `httpx`, `aiohttp` — эти модули ЗАБЛОКИРОВАНЫ в среде исполнения.
+НЕ ИСПОЛЬЗУЙ: URI вида `https://` или `files/` для чтения файла в коде — код выполняется локально, без сети.
 
+Для чтения файла в коде используй ТОЛЬКО переменную `input_path`:
 ПРАВИЛЬНО: `df = pd.read_excel(input_path)`
-ПРАВИЛЬНО: `df.to_excel(output_path, index=False)`
+ПРАВИЛЬНО: `with open(input_path, "r") as f: content = f.read()`
+ПРАВИЛЬНО: `doc = Document(input_path)`
+НЕПРАВИЛЬНО: `requests.get(file_uri)` — requests заблокирован!
 НЕПРАВИЛЬНО: `input_path = 'downloads/file.xlsx'` (перезапишет переменную!)
 
 ## Важно
-- Прочитай файл через его URI: {file_uri}
-- Сгенерируй Python-код для обработки данных
-- Верни ТОЛЬКО JSON: analysis, code, explanation
+- Прочитай файл через File API Gemini (URI выше) ТОЛЬКО для понимания структуры.
+- В генерируемом Python-коде читай файл через `input_path`.
+- Сгенерируй Python-код для обработки данных.
+- Верни ТОЛЬКО JSON: analysis, code, explanation.
 
 ## Формат ответа
 {{"analysis": "что будет сделано", "code": "Python код", "explanation": "пояснение"}}"""

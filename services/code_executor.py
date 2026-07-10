@@ -4,6 +4,7 @@
 и без доступа к os, subprocess, сети и файловой системе вне разрешённых папок.
 """
 
+import ast
 import json
 import subprocess
 import sys
@@ -328,14 +329,108 @@ _BLOCKED_PATTERNS = [
 class CodeExecutor:
     """Исполняет Python-код в отдельном процессе (subprocess или Docker-контейнер) с ограничениями."""
 
+    # Дандер-атрибуты, запрещённые на уровне AST (обход через конкатенацию строк)
+    _DANGEROUS_DUNDERS = frozenset({
+        "__subclasses__", "__bases__", "__mro__",
+        "__globals__", "__code__", "__reduce__", "__reduce_ex__",
+    })
+
     def __init__(self):
         from config import config as _cfg
         self._download_dir = str(Path(_cfg.DOWNLOAD_DIR).resolve())
         self._processed_dir = str(Path(_cfg.PROCESSED_DIR).resolve())
-        self._docker_enabled = getattr(_cfg, 'DOCKER_ENABLED', False)
+        self._docker_enabled = getattr(_cfg, 'DOCKER_ENABLED', True)
+        self._execution_timeout = getattr(_cfg, 'EXECUTION_TIMEOUT', 120)
+
+    def _check_code_ast(self, code: str) -> Optional[str]:
+        """
+        AST-анализ кода: обнаруживает опасные атрибуты (__subclasses__, __bases__ и т.д.),
+        даже если их имя собрано через конкатенацию строк.
+        Дополняет substring-based _check_blocked_patterns.
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            # Невалидный Python — sandbox отловит на exec()
+            return None
+
+        for node in ast.walk(tree):
+            # getattr(base, name) — атака через разбивку строки
+            if isinstance(node, ast.Call):
+                func = node.func
+                # getattr(x, 'опасная_строка')
+                if isinstance(func, ast.Name) and func.id == "getattr":
+                    if len(node.args) >= 2:
+                        attr_arg = node.args[1]
+                        if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                            if attr_arg.value in self._DANGEROUS_DUNDERS:
+                                return f"⛔ AST: запрещён доступ к атрибуту '{attr_arg.value}'"
+
+            # object.__subclasses__() — прямой вызов через конкатенацию строк
+            # (например, ().__class__.__bases__[0].__subcla + 'sses__' — не ловится AST,
+            #  но ловится через getattr. Конкатенация литералов Python склеивает их
+            #  ДО парсинга в байткод, но в AST это остаётся BinOp!)
+            if isinstance(node, ast.Attribute):
+                if node.attr in self._DANGEROUS_DUNDERS:
+                    return f"⛔ AST: запрещён доступ к атрибуту '{node.attr}'"
+
+            # obj.__getattribute__('__subclasses__') — обход через __getattribute__
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Attribute) and func.attr == "__getattribute__":
+                    if len(node.args) >= 1:
+                        arg = node.args[0]
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                            if arg.value in self._DANGEROUS_DUNDERS:
+                                return f"⛔ AST: запрещён __getattribute__('{arg.value}')"
+
+        # Дополнительно: проверка конкатенации строковых литералов
+        # "".__cla + "ss__" → в AST это BinOp(left=Constant('__cla'), right=Constant('ss__'))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                # Проверяем левую и правую части
+                for child in (node.left, node.right):
+                    if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                        # Собираем все конкатенированные строки
+                        combined = self._collect_string_concat(node)
+                        if combined:
+                            for dunder in self._DANGEROUS_DUNDERS:
+                                if dunder in combined:
+                                    return f"⛔ AST: обнаружена конкатенация строк, содержащая '{dunder}'"
+        return None
+
+    @staticmethod
+    def _collect_string_concat(node: ast.AST, seen: set | None = None) -> str | None:
+        """Собрать все константные строки из цепочки BinOp(+) в одну строку."""
+        if seen is None:
+            seen = set()
+        node_id = id(node)
+        if node_id in seen:
+            return None
+        seen.add(node_id)
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = CodeExecutor._collect_string_concat(node.left, seen)
+            right = CodeExecutor._collect_string_concat(node.right, seen)
+            if left is not None and right is not None:
+                return left + right
+        return None
 
     def _check_blocked_patterns(self, code: str) -> Optional[str]:
-        """Проверить код на опасные паттерны. Вернуть сообщение об ошибке или None."""
+        """Проверить код на опасные паттерны. Вернуть сообщение об ошибке или None.
+
+        Использует два слоя защиты:
+        1. AST-анализ — обнаруживает опасные атрибуты даже при конкатенации строк
+        2. Substring search — блокирует явные опасные паттерны
+        """
+        # Слой 1: AST-анализ (обход конкатенации строк)
+        ast_blocked = self._check_code_ast(code)
+        if ast_blocked:
+            return ast_blocked
+
+        # Слой 2: substring search (быстрый, для очевидных случаев)
         for pattern in _BLOCKED_PATTERNS:
             if pattern in code:
                 return f"⛔ Блокирован опасный код: найден паттерн '{pattern}'"
@@ -437,14 +532,14 @@ class CodeExecutor:
 
         try:
             input_data = config_json + "\n" + code
-            stdout_raw, stderr_raw = proc.communicate(input=input_data, timeout=120)
+            stdout_raw, stderr_raw = proc.communicate(input=input_data, timeout=self._execution_timeout)
             print(f"[CodeExecutor] stdout ({len(stdout_raw)} chars)")
             print(f"[CodeExecutor] stderr ({len(stderr_raw)} chars): {stderr_raw[:500]}")
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_raw, stderr_raw = proc.communicate()
             return self._parse_result(result, stdout_raw, stderr_raw, success=False,
-                                       extra_stderr="\n⏱️ Превышено время выполнения кода (120 сек). Процесс принудительно завершён.")
+                                       extra_stderr=f"\n⏱️ Превышено время выполнения кода ({self._execution_timeout} сек). Процесс принудительно завершён.")
 
         stdout_lines = stdout_raw.split("\n")
         stderr_combined = stderr_raw or ""
@@ -490,10 +585,20 @@ class CodeExecutor:
         print(f"[CodeExecutor] output={output_path_abs}")
 
         # Конвертируем Windows-пути в Linux-пути внутри контейнера
-        input_filename = Path(input_path_abs).name
-        output_filename = Path(output_path_abs).name
-        container_input = f"{CONTAINER_MOUNT}/downloads/{input_filename}"
-        container_output = f"{CONTAINER_MOUNT}/processed/{output_filename}"
+        # Теперь файлы лежат в user-подпапках: downloads/<user_id>/file, processed/<user_id>/file
+        # Вычисляем относительный путь от базовой директории
+        # ⚠️ Path.relative_to() на Windows возвращает пути с \, заменяем на /
+        try:
+            input_rel = str(Path(input_path_abs).relative_to(self._download_dir)).replace("\\", "/")
+        except ValueError:
+            input_rel = Path(input_path_abs).name  # fallback: только имя
+        try:
+            output_rel = str(Path(output_path_abs).relative_to(self._processed_dir)).replace("\\", "/")
+        except ValueError:
+            output_rel = Path(output_path_abs).name  # fallback: только имя
+
+        container_input = f"{CONTAINER_MOUNT}/downloads/{input_rel}"
+        container_output = f"{CONTAINER_MOUNT}/processed/{output_rel}"
         container_download_dir = f"{CONTAINER_MOUNT}/downloads"
         container_processed_dir = f"{CONTAINER_MOUNT}/processed"
 
@@ -546,7 +651,7 @@ class CodeExecutor:
             )
 
             # stdind не используется — всё через файл
-            stdout_raw_bytes, stderr_raw_bytes = proc.communicate(timeout=120)
+            stdout_raw_bytes, stderr_raw_bytes = proc.communicate(timeout=self._execution_timeout)
             stdout_raw = stdout_raw_bytes.decode("utf-8", errors="replace")
             stderr_raw = stderr_raw_bytes.decode("utf-8", errors="replace")
             print(f"[CodeExecutor] Docker stdout ({len(stdout_raw)} chars)")
@@ -559,7 +664,7 @@ class CodeExecutor:
             subprocess.run(["docker", "stop", "-t", "0"], capture_output=True)
             stdout_raw, stderr_raw = "", ""
             return self._parse_result(result, "", stderr_raw or "",
-                                       extra_stderr="\n⏱️ Превышено время выполнения кода (120 сек). Контейнер остановлен.",
+                                       extra_stderr=f"\n⏱️ Превышено время выполнения кода ({self._execution_timeout} сек). Контейнер остановлен.",
                                        success=False)
         except Exception as e:
             result["stderr"] = f"❌ Ошибка Docker: {type(e).__name__}: {e}"

@@ -38,10 +38,8 @@ def quick_actions_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🔍 Отфильтровать", callback_data="action:filter")
     builder.button(text="📊 Построить график", callback_data="action:chart")
     builder.button(text="📋 Сводная таблица", callback_data="action:pivot")
-    builder.button(text="📝 Сохранить как .docx", callback_data="action:save_docx")
-    builder.button(text="📗 Сохранить как .xlsx", callback_data="action:save_xlsx")
-    builder.button(text="📃 Сохранить как .txt", callback_data="action:save_txt")
-    builder.adjust(2, 2, 2)
+    builder.button(text="🔄 Конвертация", callback_data="action:convert")
+    builder.adjust(2, 2)
     return builder.as_markup()
 
 

@@ -56,6 +56,17 @@ async def on_startup(bot: Bot):
         logger.error("GEMINI_API_KEY не задан! Укажите его в .env файле.")
         raise ValueError("GEMINI_API_KEY is required")
 
+    # Предупреждение о режиме песочницы
+    if not config.DOCKER_ENABLED:
+        logger.warning("⚠️" + "=" * 60)
+        logger.warning("⚠️ DOCKER_ENABLED=false — код выполняется в прямом subprocess!")
+        logger.warning("⚠️ Без изоляции ОС (--network none, --read-only, --cap-drop ALL).")
+        logger.warning("⚠️ Рекомендуется включить DOCKER_ENABLED=true для продакшена.")
+        logger.warning("⚠️ Установите Docker Desktop и выполните: docker compose build sandbox")
+        logger.warning("⚠️" + "=" * 60)
+    else:
+        logger.info("🐳 Docker-изоляция песочницы ВКЛЮЧЕНА")
+
     # Очистка старых временных файлов при запуске
     file_service.cleanup_old_files(max_age_hours=1)
 

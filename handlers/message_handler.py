@@ -28,6 +28,36 @@ from utils.keyboards import (
 
 router = Router()
 
+# === Регистрация известных пользователей (для /broadcast и статистики) ===
+_known_users: set[int] = set()
+
+
+def _track_user(user_id: int):
+    """Запомнить user_id для /broadcast и статистики (персистентный список)."""
+    _known_users.add(user_id)
+
+
+def _cleanup_stale_entries():
+    """Периодически чистит мёртвые записи rate-limit и сессий."""
+    now = time.time()
+    # Чистим rate-limit словари: удаляем пользователей без активности > 1 часа
+    for times_dict in (_user_request_times, _user_upload_times):
+        stale_uids = [
+            uid for uid, stamps in times_dict.items()
+            if not stamps or (now - max(stamps)) > 3600
+        ]
+        for uid in stale_uids:
+            del times_dict[uid]
+    # Чистим сессии без файлов и без кода дольше 6 часов
+    stale_sessions = [
+        uid for uid, sess in user_sessions.items()
+        if not sess.get("file_paths") and not sess.get("last_code")
+        and uid not in _known_users  # не трогаем известных
+    ]
+    for uid in stale_sessions:
+        del user_sessions[uid]
+
+
 # === Rate Limiting ===
 _user_request_times: dict[int, list[float]] = {}
 _user_upload_times: dict[int, list[float]] = {}
@@ -57,6 +87,7 @@ user_sessions: dict[int, dict] = {}
 
 def _get_session(user_id: int) -> dict:
     """Получить или создать сессию пользователя."""
+    _track_user(user_id)
     if user_id not in user_sessions:
         user_sessions[user_id] = {
             "file_paths": [],
@@ -199,15 +230,17 @@ async def cmd_admin(message: Message):
 
     admin_id = message.from_user.id
     active_users = len(user_sessions)
+    total_users = len(_known_users)
     total_files = sum(len(s.get("file_paths", [])) for s in user_sessions.values())
 
     admin_text = (
         f"🛠 **Панель администратора**\n\n"
         f"👤 Ваш ID: `{admin_id}`\n"
+        f"👥 Всего известных пользователей: `{total_users}`\n"
         f"👥 Активных сессий: `{active_users}`\n"
         f"📎 Всего файлов в сессиях: `{total_files}`\n\n"
         f"**Команды:**\n"
-        f"`/broadcast <текст>` — отправить сообщение всем активным пользователям\n"
+        f"`/broadcast <текст>` — отправить сообщение всем известным пользователям\n"
         f"`/stats` — полная статистика бота"
     )
     await message.answer(admin_text)
@@ -227,14 +260,16 @@ async def cmd_broadcast(message: Message):
         return
 
     sent = 0
-    for uid in list(user_sessions.keys()):
+    errors = 0
+    for uid in list(_known_users):
         try:
             await message.bot.send_message(chat_id=uid, text=f"📢 **Сообщение от администратора:**\n\n{text}")
             sent += 1
+            await asyncio.sleep(0.05)  # anti-flood
         except Exception:
-            pass
+            errors += 1
 
-    await message.answer(f"✅ Сообщение отправлено `{sent}` пользователям.")
+    await message.answer(f"✅ Сообщение отправлено `{sent}` пользователям. Ошибок: `{errors}`.")
 
 
 @router.message(Command("stats"))
@@ -383,6 +418,15 @@ async def callback_action(callback: CallbackQuery):
         await callback.answer()
         return
 
+    # Действие "Конвертация" — показываем список форматов
+    if action == "convert":
+        await callback.message.edit_text(
+            "🔄 **Выберите формат для конвертации:**",
+            reply_markup=format_selection_keyboard(),
+        )
+        await callback.answer()
+        return
+
     # Действия без уточнения — сразу отправляем в AI
     action_commands = {
         "save_docx": "Сохрани все данные в формате Word (.docx). Сделай документ с таблицами и форматированием.",
@@ -451,9 +495,11 @@ async def callback_format(callback: CallbackQuery):
     await callback.answer()
 
     command = (
-        f"Сохрани данные в формате {target_format.upper()}. "
-        f"Используй output_dir для создания файла с расширением .{target_format}. "
-        f"Если это табличные данные — сохрани через pandas."
+        f"Конвертируй файл в формат {target_format.upper()}. "
+        f"Извлеки ВСЕ данные из исходного файла и сохрани их в {target_format.upper()}."
+        f"НЕ делай анализ, НЕ считай статистику, НЕ описывай данные. "
+        f"Просто сохрани сами данные в новом формате. "
+        f"Если это табличные данные — используй pandas."
     )
     await _process_action(callback.message, user_id, command, require_confirm=False)
 
@@ -556,6 +602,39 @@ async def handle_text(message: Message):
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
 
+# Соответствие между ключевыми словами в команде и расширениями файлов
+_TARGET_FORMAT_KEYWORDS: dict[str, list[str]] = {
+    ".txt":  [".txt", "txt", "текстовый формат", "text format", "сохрани как txt", "в txt"],
+    ".csv":  [".csv", "csv", "csv формат", "csv format", "в csv"],
+    ".xlsx": [".xlsx", "xlsx", "excel (.xlsx)", "в xlsx"],
+    ".xls":  [".xls", "xls", "excel (.xls)", "в xls"],
+    ".ods":  [".ods", "ods", "в ods"],
+    ".docx": [".docx", "docx", "word (.docx)", "формате docx", "формате word", "в docx"],
+    ".doc":  [".doc", "doc", "в doc"],
+    ".json": [".json", "json", "json формат", "json format", "в json"],
+}
+
+
+def _detect_target_extension(command: str, source_ext: str) -> str:
+    """Определить целевое расширение из текста команды пользователя.
+
+    Args:
+        command: Команда пользователя (например, "сохрани в txt").
+        source_ext: Расширение исходного файла (например, ".xlsx").
+
+    Returns:
+        str: Целевое расширение (например, ".txt") или source_ext, если не найдено.
+    """
+    cmd_lower = command.lower()
+
+    for ext, keywords in _TARGET_FORMAT_KEYWORDS.items():
+        for kw in keywords:
+            if kw in cmd_lower:
+                return ext
+
+    return source_ext
+
+
 async def _process_ai_request(user_id: int, command: str, file_paths: list[str]) -> Optional[tuple]:
     """Собрать контекст → отправить в AI → получить (analysis, code, explanation, output_path)."""
 
@@ -565,9 +644,15 @@ async def _process_ai_request(user_id: int, command: str, file_paths: list[str])
     primary_name = Path(primary_file).name
     parts = primary_name.split("_", 1)
     clean_name = parts[1] if len(parts) > 1 else primary_name
-    base, ext = os.path.splitext(clean_name)
-    output_name = f"{base}_result{ext}"
-    output_path = str(Path(config.PROCESSED_DIR) / output_name)
+    base, source_ext = os.path.splitext(clean_name)
+    # Определяем целевое расширение из команды пользователя
+    target_ext = _detect_target_extension(command, source_ext)
+    output_name = f"{base}_result{target_ext}"
+    # 🛡️ Изоляция по user_id: каждый пользователь — своя подпапка
+    # (предотвращает перезапись результата одного пользователя другим)
+    user_output_dir = Path(config.PROCESSED_DIR) / str(user_id)
+    user_output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = str(user_output_dir / output_name)
 
     if config.EXECUTION_MODE == "assistants":
         # Gemini читает файл через File API, генерирует код, exec — локальный
@@ -679,15 +764,20 @@ async def _send_result_file(message: Message, user_id: int, output_path: str, ex
     if output_path_obj.exists():
         found_file = output_path_obj
     else:
-        # Ищем в ПАПКЕ ПОЛЬЗОВАТЕЛЯ (не跨-user) файлы младше 10 секунд
+        # Ищем в ПАПКЕ ПОЛЬЗОВАТЕЛЯ файлы младше 60 секунд
+        # (увеличенный запас для конвертации форматов / медленных операций)
         user_processed = Path(config.PROCESSED_DIR) / str(user_id)
         if user_processed.exists():
             recent = sorted(
-                [f for f in user_processed.iterdir() if f.is_file() and now - f.stat().st_mtime < 10],
+                [f for f in user_processed.iterdir() if f.is_file() and now - f.stat().st_mtime < 60],
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
             found_file = recent[0] if recent else None
+            # Если нашли файл, но его расширение не совпадает с ожидаемым —
+            # это нормально при конвертации форматов
+            if found_file and found_file.suffix != output_path_obj.suffix:
+                print(f"[_send_result_file] Формат изменён: был {output_path_obj.suffix}, создан {found_file.suffix}")
         else:
             found_file = None
 

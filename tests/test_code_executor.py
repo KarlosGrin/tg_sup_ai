@@ -23,6 +23,7 @@ def _patch_docker_disabled(monkeypatch):
     В .env может быть DOCKER_ENABLED=true, это ломает тесты.
     """
     monkeypatch.setattr("config.config.DOCKER_ENABLED", False)
+    monkeypatch.setattr("config.config.EXECUTION_TIMEOUT", 30)  # быстрый таймаут для тестов
 
 
 @pytest.fixture
@@ -111,6 +112,98 @@ class TestBlockDangerousImports:
         result = executor.execute(code, str(sample_excel), str(output_path))
         assert not result["success"]
         assert "breakpoint" in result["stderr"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# AST-анализ: обход блок-листа через конкатенацию строк
+# ═══════════════════════════════════════════════════════════════
+
+class TestASTAnalysis:
+    """Тесты: AST-анализ должен ловить обфусцированный код (конкатенация строк)."""
+
+    # Прямое обращение через .__subclasses__() должно блокироваться AST
+    @pytest.mark.parametrize("attr", [
+        "__subclasses__", "__bases__", "__mro__",
+        "__globals__", "__code__", "__reduce__", "__reduce_ex__",
+    ])
+    def test_block_dunder_attribute_direct(self, attr, executor, sample_excel, output_path):
+        """Прямой вызов .{attr}() должен блокироваться AST."""
+        code = f"x = ().__class__.__bases__[0].{attr}()"
+        result = executor.execute(code, str(sample_excel), str(output_path))
+        assert not result["success"]
+        assert "AST" in result["stderr"] or attr in result["stderr"]
+
+    # getattr(base, 'строка') — обход через разбивку
+    @pytest.mark.parametrize("attr", [
+        "__subclasses__", "__bases__", "__mro__",
+        "__globals__", "__code__",
+    ])
+    def test_block_getattr_string(self, attr, executor, sample_excel, output_path):
+        """getattr(obj, '{attr}') должен блокироваться AST."""
+        code = f"x = getattr(().__class__.__bases__[0], '{attr}')"
+        result = executor.execute(code, str(sample_excel), str(output_path))
+        assert not result["success"]
+        assert "AST" in result["stderr"] or attr in result["stderr"]
+
+    # Конкатенация строковых литералов: '__subcla' + 'sses__'
+    @pytest.mark.parametrize("parts,dunder", [
+        (["__subcla", "sses__"], "__subclasses__"),
+        (["__ba", "ses__"], "__bases__"),
+        (["__m", "ro__"], "__mro__"),
+        (["__glo", "bals__"], "__globals__"),
+        (["__cod", "e__"], "__code__"),
+        (["__reduc", "e__"], "__reduce__"),
+        (["__reduce_", "ex__"], "__reduce_ex__"),
+    ])
+    def test_block_string_concatenation(self, parts, dunder, executor, sample_excel, output_path):
+        """Конкатенация строк '{parts[0]}' + '{parts[1]}' должна блокироваться AST."""
+        code = f"""
+base = ().__class__.__bases__[0]
+name = '{parts[0]}' '{parts[1]}'
+for cls in getattr(base, name)():
+    if cls.__name__ == 'Popen':
+        pass
+"""
+        result = executor.execute(code, str(sample_excel), str(output_path))
+        assert not result["success"]
+        assert "AST" in result["stderr"] or "запрещён" in result["stderr"]
+
+    # __getattribute__('__subclasses__')
+    @pytest.mark.parametrize("attr", [
+        "__subclasses__", "__bases__", "__mro__",
+        "__globals__", "__code__",
+    ])
+    def test_block_getattribute(self, attr, executor, sample_excel, output_path):
+        """obj.__getattribute__('{attr}') должен блокироваться AST."""
+        code = f"x = object.__getattribute__(object(), '{attr}')"
+        result = executor.execute(code, str(sample_excel), str(output_path))
+        assert not result["success"]
+        assert "AST" in result["stderr"] or attr in result["stderr"]
+
+    # Легитимный код не должен ложно срабатывать
+    def test_ast_allows_legitimate_getattr(self, executor, sample_excel, output_path):
+        """getattr с обычными именами атрибутов должен работать."""
+        code = """
+import pandas as pd
+df = pd.read_excel(input_path)
+col_name = getattr(df, 'name')
+print(f"Column type: {type(col_name)}")
+df.to_excel(output_path, index=False)
+"""
+        result = executor.execute(code, str(sample_excel), str(output_path))
+        assert result["success"], f"Legitimate getattr blocked: {result['stderr']}"
+        assert output_path.exists()
+
+    def test_ast_allows_class_name_access(self, executor, sample_excel, output_path):
+        """obj.__class__.__name__ — легитимный паттерн, не должен блокироваться."""
+        code = """
+import pandas as pd
+df = pd.read_excel(input_path)
+print(f"Type: {df['name'].__class__.__name__}")
+df.to_excel(output_path, index=False)
+"""
+        result = executor.execute(code, str(sample_excel), str(output_path))
+        assert result["success"], f"__class__.__name__ blocked: {result['stderr']}"
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -31,14 +31,18 @@ class FileService:
         self._user_files: dict[int, dict[str, list[str]]] = {}
 
     async def download_file(self, document: Document, user_id: int, bot=None) -> Optional[Path]:
-        """Скачать файл из Telegram во временную директорию."""
+        """Скачать файл из Telegram во временную директорию (в подпапку пользователя)."""
         ext = Path(document.file_name).suffix.lower()
         if ext not in self.ALLOWED_EXTENSIONS:
             return None
 
+        # 🛡️ Изоляция: каждый пользователь — своя подпапка в downloads/
+        user_download_dir = self.download_dir / str(user_id)
+        user_download_dir.mkdir(parents=True, exist_ok=True)
+
         # Уникальное имя для избежания коллизий
         unique_name = f"{uuid.uuid4().hex}_{document.file_name}"
-        save_path = self.download_dir / unique_name
+        save_path = user_download_dir / unique_name
 
         # aiogram 3.x: используем bot.download() вместо document.download()
         if bot:
@@ -100,11 +104,12 @@ class FileService:
                     pass
 
     def cleanup_old_files(self, max_age_hours: int = 24):
-        """Очистка всех временных файлов старше N часов."""
+        """Очистка всех временных файлов старше N часов (рекурсивно по подпапкам пользователей)."""
         import time
         now = time.time()
         for directory in [self.download_dir, self.processed_dir]:
-            for f in directory.iterdir():
+            # Чистим файлы рекурсивно (в т.ч. в user-подпапках)
+            for f in directory.rglob("*"):
                 if f.is_file():
                     file_age = now - f.stat().st_mtime
                     if file_age > max_age_hours * 3600:
@@ -112,6 +117,13 @@ class FileService:
                             f.unlink()
                         except OSError:
                             pass
+            # Удаляем пустые подпапки
+            for subdir in sorted(directory.iterdir(), key=lambda p: str(p), reverse=True):
+                if subdir.is_dir():
+                    try:
+                        subdir.rmdir()  # удалит только пустую
+                    except OSError:
+                        pass
 
     @staticmethod
     def _validate_magic_bytes(file_path: str, expected_ext: str) -> bool:
