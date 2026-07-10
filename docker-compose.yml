@@ -32,7 +32,7 @@ services:
       - ./processed:/app/processed
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'python main.py' || exit 1"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 30s
       timeout: 10s
       retries: 3

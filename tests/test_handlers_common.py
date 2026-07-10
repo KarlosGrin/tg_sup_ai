@@ -199,18 +199,18 @@ class TestIsAdmin:
 
     def test_admin_id_in_list(self, monkeypatch):
         """ID из списка ADMIN_IDS — админ."""
-        monkeypatch.setattr(config, "ADMIN_IDS", [123, 456])
+        monkeypatch.setattr(config, "ADMIN_IDS_RAW", "123,456")
         assert _is_admin(123)
         assert _is_admin(456)
 
     def test_non_admin_id_not_in_list(self, monkeypatch):
         """ID не из списка — не админ."""
-        monkeypatch.setattr(config, "ADMIN_IDS", [123, 456])
+        monkeypatch.setattr(config, "ADMIN_IDS_RAW", "123,456")
         assert not _is_admin(789)
 
     def test_empty_admin_list(self, monkeypatch):
         """Пустой список ADMIN_IDS — никто не админ."""
-        monkeypatch.setattr(config, "ADMIN_IDS", [])
+        monkeypatch.setattr(config, "ADMIN_IDS_RAW", "")
         assert not _is_admin(123)
         assert not _is_admin(0)
 

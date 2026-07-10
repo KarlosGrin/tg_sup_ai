@@ -4,6 +4,7 @@
 Логирует всё, что дольше порога. Собирает статистику для /perf.
 """
 
+import hashlib
 import logging
 import statistics
 import time
@@ -20,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 _stats: dict[str, list[float]] = defaultdict(list)
 _MAX_SAMPLES = 1000  # храним не больше 1000 замеров на точку
+
+
+def _anonymize(user_id: int | None) -> str:
+    """Анонимизировать user_id: первые 4 символа sha256."""
+    from config import config as _cfg
+    if user_id is None or not _cfg.LOG_ANONYMIZE_USER_ID:
+        return str(user_id) if user_id else "?"
+    return hashlib.sha256(str(user_id).encode()).hexdigest()[:8]
 
 
 def _record(label: str, duration: float):
@@ -58,6 +67,7 @@ class ProfilingMiddleware(BaseMiddleware):
     """
     Middleware, замеряющий время обработки каждого апдейта.
     Логирует всё, что дольше SLOW_THRESHOLD секунд.
+    User-ID анонимизируется (sha256[:8]) если LOG_ANONYMIZE_USER_ID=true.
     """
 
     SLOW_THRESHOLD = 1.0
@@ -79,7 +89,7 @@ class ProfilingMiddleware(BaseMiddleware):
 
             logger.warning(
                 "🐢 SLOW %s: %.2f сек (user=%s, update_id=%s)",
-                event_type, duration, user_id, getattr(event, "update_id", "?"),
+                event_type, duration, _anonymize(user_id), getattr(event, "update_id", "?"),
             )
         return result
 

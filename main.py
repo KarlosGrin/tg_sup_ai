@@ -6,15 +6,17 @@
 
 Переменные окружения (файл .env):
     BOT_TOKEN          — токен Telegram бота (обязательно)
-    CHANNEL_ID         — ID канала (по умолчанию -1004469769190)
-    OPENAI_API_KEY     — ключ OpenAI API (обязательно)
-    OPENAI_MODEL       — модель (по умолчанию gpt-4o)
+    CHANNEL_ID         — ID канала (опционально)
+    OPENAI_API_KEY     — ключ OpenAI API
+    AI_PROVIDER        — "openai" (по умолчанию) или "gemini"
     EXECUTION_MODE     — "local" (по умолчанию) или "assistants"
     ADMIN_IDS          — ID администраторов через запятую
+    SENTRY_DSN         — DSN для Sentry (опционально)
+    REDIS_URL          — Redis URL для FSM (опционально)
+    HEALTH_PORT        — порт для health endpoint (по умолчанию 8080)
 """
 
 import asyncio
-import logging
 import sys
 
 from aiogram import Bot, Dispatcher
@@ -33,16 +35,166 @@ from services.file_service import file_service
 from services.profiler import ProfilingMiddleware
 from utils.profiler_decorator import start_yappi
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ],
-)
-logger = logging.getLogger(__name__)
+# ════════════════════════════════════════════════════════════════
+# Loguru — структурированное логирование
+# ════════════════════════════════════════════════════════════════
+import logging
+
+from loguru import logger as loguru_logger
+
+
+class _InterceptHandler(logging.Handler):
+    """Перенаправляет стандартные logging-сообщения в loguru."""
+
+    def emit(self, record: logging.Record) -> None:
+        try:
+            level = loguru_logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        frame, depth = logging.currentframe(), 2
+        while frame and frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+        loguru_logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+
+def _setup_logging() -> None:
+    """Настройка loguru с ротацией и форматированием."""
+    loguru_logger.remove()  # убираем default stderr handler
+
+    # Формат: время | уровень | имя_модуля | сообщение
+    fmt = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level:^7}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+        "<level>{message}</level>"
+    )
+
+    # Console handler (цветной)
+    loguru_logger.add(
+        sys.stdout,
+        format=fmt,
+        level=config.LOG_LEVEL,
+        colorize=True,
+    )
+
+    # File handler (с ротацией)
+    loguru_logger.add(
+        config.LOG_FILE,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:^7} | {name}:{function}:{line} | {message}",
+        level=config.LOG_LEVEL,
+        rotation=config.LOG_ROTATION,
+        retention=config.LOG_RETENTION,
+        encoding="utf-8",
+        compression="gz",
+    )
+
+    # Перехватываем стандартное logging → loguru
+    logging.basicConfig(handlers=[_InterceptHandler()], level=0, force=True)
+
+    # Отключаем шумные логгеры библиотек
+    for noisy in ("aiogram", "httpx", "httpcore", "urllib3", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_setup_logging()
+logger = loguru_logger
+
+# ════════════════════════════════════════════════════════════════
+# Sentry — централизованный сбор ошибок (опционально)
+# ════════════════════════════════════════════════════════════════
+
+_sentry_initialized = False
+
+
+def _init_sentry() -> None:
+    """Инициализация Sentry, если настроен SENTRY_DSN."""
+    global _sentry_initialized
+    if config.SENTRY_ENABLED and config.SENTRY_DSN:
+        try:
+            import sentry_sdk
+
+            sentry_sdk.init(
+                dsn=config.SENTRY_DSN,
+                environment="production" if config.DOCKER_ENABLED else "development",
+                traces_sample_rate=0.1,
+                profiles_sample_rate=0.1,
+                enable_tracing=True,
+            )
+            _sentry_initialized = True
+            logger.info("🗼 Sentry инициализирован")
+        except Exception as e:
+            logger.warning("⚠️ Не удалось инициализировать Sentry: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# FastAPI health endpoint + Prometheus metrics
+# ════════════════════════════════════════════════════════════════
+
+_health_server = None
+
+
+async def _start_health_server() -> None:
+    """Запуск FastAPI health/метрики сервера в фоне."""
+    global _health_server
+    try:
+        import uvicorn
+        from fastapi import FastAPI
+        from prometheus_client import make_asgi_app
+
+        app = FastAPI(title="tg_sup_ai Health", docs_url=None, redoc_url=None)
+
+        # Health check
+        @app.get("/health")
+        @app.get("/healthz")
+        async def health():
+            return {"status": "ok", "service": "tg_sup_ai", "version": "1.0.0"}
+
+        @app.get("/readyz")
+        async def ready():
+            return {"status": "ready"}
+
+        # Prometheus metrics (монтируем ASGI-приложение на /metrics)
+        metrics_app = make_asgi_app()
+        app.mount("/metrics", metrics_app)
+
+        config_obj = uvicorn.Config(app, host="0.0.0.0", port=config.HEALTH_PORT, log_level="warning")
+        _health_server = uvicorn.Server(config_obj)
+        logger.info("🏥 Health-сервер запущен на порту {port}", port=config.HEALTH_PORT)
+        await _health_server.serve()
+    except (ImportError, Exception) as e:
+        logger.warning("⚠️ Health-сервер не запущен (fastapi/uvicorn не установлены): {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# Redis FSM (опционально)
+# ════════════════════════════════════════════════════════════════
+
+_redis_storage = None
+
+
+async def _init_redis_storage() -> None:
+    """Инициализация RedisStorage для FSM, если REDIS_ENABLED."""
+    global _redis_storage
+    if config.REDIS_ENABLED:
+        try:
+            from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
+            from redis.asyncio import Redis
+
+            redis = Redis.from_url(
+                config.REDIS_URL,
+                decode_responses=True,
+            )
+            await redis.ping()
+            _redis_storage = RedisStorage(
+                redis=redis,
+                key_builder=DefaultKeyBuilder(with_destiny=True),
+            )
+            logger.info("🗄️ Redis FSM инициализирован: {url}", url=config.REDIS_URL)
+        except Exception as e:
+            logger.warning("⚠️ Redis недоступен ({url}), используется in-memory storage: {e}",
+                           url=config.REDIS_URL, e=e)
+
 
 # placeholder для yappi stop (заполняется в on_startup)
 _stop_yappi = lambda: None
@@ -53,18 +205,8 @@ async def on_startup(bot: Bot):
     logger.info("=" * 50)
     logger.info("Бот запускается...")
 
-    # Проверка конфигурации
-    if not config.BOT_TOKEN:
-        logger.error("BOT_TOKEN не задан! Укажите его в .env файле.")
-        raise ValueError("BOT_TOKEN is required")
-
-    if config.AI_PROVIDER == "openai" and not config.OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY не задан! Укажите его в .env файле.")
-        raise ValueError("OPENAI_API_KEY is required")
-
-    if config.AI_PROVIDER == "gemini" and not config.GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY не задан! Укажите его в .env файле.")
-        raise ValueError("GEMINI_API_KEY is required")
+    # Инициализация Sentry
+    _init_sentry()
 
     # Запуск yappi-профайлера для async-кода (если ENABLE_PROFILING=true)
     global _stop_yappi
@@ -109,18 +251,27 @@ async def on_startup(bot: Bot):
     logger.info(f"Бот: @{bot_info.username} (ID: {bot_info.id})")
 
     # Проверяем права в канале
-    try:
-        chat = await bot.get_chat(config.CHANNEL_ID)
-        logger.info(f"Канал: {chat.title} (ID: {chat.id})")
-    except Exception as e:
-        logger.warning(f"Не удалось получить информацию о канале {config.CHANNEL_ID}: {e}")
-        logger.info("Бот будет работать в режиме личных сообщений.")
+    if config.CHANNEL_ID:
+        try:
+            chat = await bot.get_chat(int(config.CHANNEL_ID))
+            logger.info(f"Канал: {chat.title} (ID: {chat.id})")
+        except Exception as e:
+            logger.warning(f"Не удалось получить информацию о канале {config.CHANNEL_ID}: {e}")
+            logger.info("Бот будет работать в режиме личных сообщений.")
+    else:
+        logger.info("CHANNEL_ID не задан — бот работает в режиме личных сообщений.")
 
     logger.info("Бот успешно запущен и готов к работе!")
     logger.info("=" * 50)
 
     # Запуск фоновой задачи очистки мёртвых записей (каждый час)
     asyncio.create_task(_periodic_cleanup())
+
+    # Запуск health-сервера
+    asyncio.create_task(_start_health_server())
+
+    # Инициализация Redis FSM
+    await _init_redis_storage()
 
 
 async def _periodic_cleanup():
@@ -139,8 +290,22 @@ async def _periodic_cleanup():
 async def on_shutdown(bot: Bot):
     """Действия при остановке бота."""
     logger.info("Бот останавливается...")
+
+    # Остановка health-сервера
+    global _health_server
+    if _health_server:
+        _health_server.should_exit = True
+        logger.info("🏥 Health-сервер остановлен")
+
+    # Закрытие Redis
+    global _redis_storage
+    if _redis_storage:
+        await _redis_storage.close()
+        logger.info("🗄️ Redis FSM закрыт")
+
     # Остановка yappi-профайлера (если был запущен)
     _stop_yappi()
+
     # Очистка всех временных файлов
     file_service.cleanup_old_files(max_age_hours=0)
     logger.info("Временные файлы очищены.")
@@ -163,7 +328,7 @@ async def main():
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher()
+    dp = Dispatcher(storage=_redis_storage)
 
     # Регистрируем профайлер (замеряет все хендлеры)
     dp.message.middleware(ProfilingMiddleware())
