@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +17,7 @@ import pandas as pd
 
 # ══════════════════════════════════════════════════════════════════
 # Sandbox-обёртка — запускается в отдельном процессе через subprocess
+# (читает конфиг из stdin: первая строка — JSON)
 # ══════════════════════════════════════════════════════════════════
 _SANDBOX_BOOTSTRAP = textwrap.dedent("""\
     import sys, json, pathlib, traceback
@@ -38,10 +40,11 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent("""\
     import json as _json_mod
 
     # 3. Белый список модулей, которые можно импортировать из пользовательского кода
+    # ⚠️ Никогда не добавляйте сюда "os", "subprocess", "shutil", "socket" и т.д.
     _ALLOWED_IMPORTS = {
         "pandas", "numpy", "openpyxl", "docx", "xlwt", "odf",
         "re", "datetime", "math", "collections", "itertools", "statistics", "copy",
-        "json", "pathlib", "io", "typing", "os.path", "os",
+        "json", "pathlib", "io", "typing",
         "xml", "xml.etree", "xml.etree.ElementTree",
     }
 
@@ -149,22 +152,187 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent("""\
         sys.stderr.write(redirected_err.getvalue())
 """)
 
+# ══════════════════════════════════════════════════════════════════
+# Sandbox-обёртка ДЛЯ DOCKER — читает скрипт из файла (sys.argv[1]).
+# Файл содержит: строка 1 = JSON-конфиг, остальное = код пользователя.
+# ══════════════════════════════════════════════════════════════════
+_SANDBOX_BOOTSTRAP_FILE = textwrap.dedent("""\
+    import sys, json, pathlib, traceback
+    from io import StringIO
+
+    # 1. Читаем конфиг из первой строки файла (путь в sys.argv[1])
+    script_path = sys.argv[1]
+    with open(script_path, "r") as _sf:
+        config_line = _sf.readline().strip()
+    cfg = json.loads(config_line)
+
+    download_dir = cfg["download_dir"]
+    processed_dir = cfg["processed_dir"]
+    input_path = cfg["input_path"]
+    output_path = cfg["output_path"]
+    output_dir = cfg["output_dir"]
+
+    # 2. Импорт разрешённых модулей (ДО ограничения builtins — нужен __import__)
+    import pandas as pd
+    import numpy as np
+    import re, datetime, math, collections, itertools, statistics, copy
+    import json as _json_mod
+
+    # 3. Белый список модулей
+    _ALLOWED_IMPORTS = {
+        "pandas", "numpy", "openpyxl", "docx", "xlwt", "odf",
+        "re", "datetime", "math", "collections", "itertools", "statistics", "copy",
+        "json", "pathlib", "io", "typing",
+        "xml", "xml.etree", "xml.etree.ElementTree",
+    }
+
+    _real_import = __import__
+    def _safe_import(name, *args, **kwargs):
+        if name in _ALLOWED_IMPORTS:
+            return _real_import(name, *args, **kwargs)
+        for allowed in _ALLOWED_IMPORTS:
+            if name.startswith(allowed + "."):
+                return _real_import(name, *args, **kwargs)
+        raise ImportError(f"⛔ Импорт модуля '{name}' запрещён")
+
+    # 4. Ограниченные builtins
+    safe_builtins = {
+        "True": True, "False": False, "None": None,
+        "Ellipsis": Ellipsis, "NotImplemented": NotImplemented,
+        "bool": bool, "int": int, "float": float, "complex": complex,
+        "str": str, "bytes": bytes, "bytearray": bytearray,
+        "list": list, "dict": dict, "tuple": tuple, "set": set, "frozenset": frozenset,
+        "object": object, "type": type, "slice": slice,
+        "range": range, "enumerate": enumerate, "zip": zip,
+        "map": map, "filter": filter, "reversed": reversed, "sorted": sorted,
+        "iter": iter, "next": next,
+        "len": len, "min": min, "max": max, "sum": sum, "any": any, "all": all,
+        "abs": abs, "round": round, "pow": pow, "divmod": divmod,
+        "ord": ord, "chr": chr, "repr": repr, "ascii": ascii, "format": format,
+        "hash": hash, "id": id,
+        "isinstance": isinstance, "issubclass": issubclass,
+        "hasattr": hasattr, "getattr": getattr, "setattr": setattr, "delattr": delattr,
+        "callable": callable,
+        "staticmethod": staticmethod, "classmethod": classmethod,
+        "property": property, "super": super,
+        "print": print,
+        "Exception": Exception, "BaseException": BaseException,
+        "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
+        "IndexError": IndexError, "AttributeError": AttributeError,
+        "StopIteration": StopIteration, "RuntimeError": RuntimeError,
+        "FileNotFoundError": FileNotFoundError, "OSError": OSError,
+        "IOError": IOError, "ZeroDivisionError": ZeroDivisionError,
+        "AssertionError": AssertionError, "ImportError": ImportError,
+        "NotImplementedError": NotImplementedError, "NameError": NameError,
+        "SyntaxError": SyntaxError, "IndentationError": IndentationError,
+        "KeyboardInterrupt": KeyboardInterrupt, "SystemExit": SystemExit,
+        "MemoryError": MemoryError, "RecursionError": RecursionError,
+        "OverflowError": OverflowError, "ArithmeticError": ArithmeticError,
+        "LookupError": LookupError,
+        "__import__": _safe_import,
+    }
+
+    # 5. Безопасный open()
+    ALLOWED_DIRS = [download_dir, processed_dir]
+    _real_open = open
+    def _safe_open(file, mode="r", *args, **kwargs):
+        try:
+            resolved = str(pathlib.Path(file).resolve())
+        except Exception:
+            raise PermissionError(f"Access denied: invalid path '{file}'")
+        for d in ALLOWED_DIRS:
+            if resolved.startswith(d):
+                return _real_open(file, mode, *args, **kwargs)
+        raise PermissionError(f"Access denied: '{file}' not in allowed directories")
+
+    safe_builtins["open"] = _safe_open
+
+    # 6. Формируем namespace
+    namespace = {
+        "__builtins__": safe_builtins,
+        "pd": pd, "pandas": pd, "np": np, "numpy": np,
+        "input_path": input_path,
+        "output_path": output_path,
+        "output_dir": output_dir,
+        "re": re, "datetime": datetime, "math": math,
+        "collections": collections, "itertools": itertools,
+        "statistics": statistics, "copy": copy,
+    }
+
+    for mod_name in ("openpyxl", "docx", "xlwt", "odf"):
+        try:
+            namespace[mod_name] = __import__(mod_name)
+        except ImportError:
+            pass
+
+    # 7. Читаем и выполняем код пользователя (всё после первой строки)
+    with open(script_path, "r") as _sf:
+        _sf.readline()  # пропускаем строку конфига
+        code_lines = _sf.read()
+
+    redirected_out = StringIO()
+    redirected_err = StringIO()
+    old_out, old_err = sys.stdout, sys.stderr
+
+    try:
+        sys.stdout = redirected_out
+        sys.stderr = redirected_err
+        exec(code_lines, namespace)
+        print("__EXIT_SUCCESS__", flush=True)
+    except Exception:
+        traceback.print_exc(file=redirected_err)
+        print("__EXIT_FAILURE__", flush=True)
+    finally:
+        sys.stdout = old_out
+        sys.stderr = old_err
+        sys.stdout.write(redirected_out.getvalue())
+        sys.stderr.write(redirected_err.getvalue())
+""")
+
+# Имя Docker-образа для sandbox-контейнера
+DOCKER_SANDBOX_IMAGE = "tg_sup_ai-sandbox:latest"
+
+# Параметры запуска Docker-контейнера (CPU, memory, network)
+DOCKER_RUN_ARGS = [
+    "--rm",                          # удалить контейнер после выполнения
+    "--network", "none",             # без сетевого доступа
+    "--read-only",                   # файловая система только для чтения
+    "--tmpfs", "/tmp:size=100m,noexec,nosuid",  # /tmp в памяти, без exec
+    "--memory", "512m",              # лимит RAM
+    "--cpus", "1",                   # лимит CPU (1 ядро)
+    "--security-opt", "no-new-privileges:true",  # запрет повышения привилегий
+    "--cap-drop", "ALL",             # удалить все capabilities
+]
+
 # Блок-лист опасных паттернов в коде (дополнительный слой защиты)
+# ВНИМАНИЕ: это поиск подстроки, а не AST-анализ — защита от случайных/наивных попыток.
 _BLOCKED_PATTERNS = [
+    # Модули ОС / исполнение команд
     "subprocess", "shutil", "socket", "ctypes",
     "requests", "urllib", "http.client", "httpx", "aiohttp",
-    "cryptography", "signal", "__builtins__",
-    "__subclasses__", "__mro__", "__globals__", "__code__",
+    # Криптография / сигналы
+    "cryptography", "signal",
+    # Обход sandbox через MRO и dunder-атрибуты
+    # ⚠️ __class__ НЕ добавляем — слишком част в легитимном коде (obj.__class__.__name__ и т.п.)
+    "__builtins__", "__subclasses__", "__mro__", "__globals__", "__code__",
+    "__reduce__", "__reduce_ex__",
+    # Динамическая компиляция/исполнение кода
+    "compile(", "eval(", "exec(",
+    # Сериализация с риском RCE
+    "pickle", "marshal", "base64",
+    # Встроенный отладчик
+    "breakpoint",
 ]
 
 
 class CodeExecutor:
-    """Исполняет Python-код в отдельном subprocess с ограниченным sandbox."""
+    """Исполняет Python-код в отдельном процессе (subprocess или Docker-контейнер) с ограничениями."""
 
     def __init__(self):
         from config import config as _cfg
         self._download_dir = str(Path(_cfg.DOWNLOAD_DIR).resolve())
         self._processed_dir = str(Path(_cfg.PROCESSED_DIR).resolve())
+        self._docker_enabled = getattr(_cfg, 'DOCKER_ENABLED', False)
 
     def _check_blocked_patterns(self, code: str) -> Optional[str]:
         """Проверить код на опасные паттерны. Вернуть сообщение об ошибке или None."""
@@ -202,7 +370,7 @@ class CodeExecutor:
 
     def execute(self, code: str, input_path: str, output_path: str) -> dict:
         """
-        Выполнить Python-код в отдельном subprocess с sandbox-ограничениями.
+        Выполнить Python-код в изолированном процессе (subprocess или Docker).
 
         Args:
             code: Python-код для выполнения.
@@ -243,12 +411,21 @@ class CodeExecutor:
         }
         config_json = json.dumps(sandbox_cfg)
 
-        print(f"[CodeExecutor] Запуск subprocess cwd={Path.cwd()}")
-        print(f"[CodeExecutor] input={input_path_abs}")
-        print(f"[CodeExecutor] output={output_path_abs}")
-        print(f"[CodeExecutor] код (первые 200 символов): {code[:200]}")
+        # === Выбор способа выполнения ===
+        if self._docker_enabled:
+            return self._execute_in_docker(code, config_json, input_path_abs, output_path_abs, result)
+        else:
+            return self._execute_direct(code, config_json, result)
 
-        # === Запуск subprocess ===
+    def _execute_direct(self, code: str, config_json: str, result: dict) -> dict:
+        """
+        Выполнить код напрямую через subprocess (тот же интерпретатор Python).
+        Используется когда Docker недоступен (DOCKER_ENABLED=false).
+        """
+        output_path = result["output_path"]
+
+        print(f"[CodeExecutor] Режим: прямой subprocess (cwd={Path.cwd()})")
+
         proc = subprocess.Popen(
             [sys.executable, "-c", _SANDBOX_BOOTSTRAP],
             stdin=subprocess.PIPE,
@@ -259,7 +436,6 @@ class CodeExecutor:
         )
 
         try:
-            # Пишем конфиг (первая строка) + код (остальной stdin)
             input_data = config_json + "\n" + code
             stdout_raw, stderr_raw = proc.communicate(input=input_data, timeout=120)
             print(f"[CodeExecutor] stdout ({len(stdout_raw)} chars)")
@@ -267,16 +443,11 @@ class CodeExecutor:
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_raw, stderr_raw = proc.communicate()
-            result["success"] = False
-            result["stdout"] = stdout_raw or ""
-            result["stderr"] = (stderr_raw or "") + "\n⏱️ Превышено время выполнения кода (120 сек). Процесс принудительно завершён."
-            return result
+            return self._parse_result(result, stdout_raw, stderr_raw, success=False,
+                                       extra_stderr="\n⏱️ Превышено время выполнения кода (120 сек). Процесс принудительно завершён.")
 
-        # === Парсим результат ===
         stdout_lines = stdout_raw.split("\n")
         stderr_combined = stderr_raw or ""
-
-        # Ищем маркер завершения в stdout
         success_marker = "__EXIT_SUCCESS__"
         failure_marker = "__EXIT_FAILURE__"
 
@@ -284,26 +455,148 @@ class CodeExecutor:
         clean_stdout = "\n".join(clean_stdout_lines).strip()
 
         if success_marker in stdout_raw:
-            result["success"] = True
-            result["stdout"] = clean_stdout
-            result["stderr"] = stderr_combined.strip()
+            result = self._parse_result(result, clean_stdout, stderr_combined.strip(), success=True)
         elif failure_marker in stdout_raw:
-            result["success"] = False
-            result["stdout"] = clean_stdout
-            result["stderr"] = stderr_combined.strip() or "Код завершился с ошибкой."
+            result = self._parse_result(result, clean_stdout, stderr_combined.strip() or "Код завершился с ошибкой.", success=False)
         else:
-            # Нет маркера — вероятно, процесс был прерван
-            result["success"] = False
-            result["stdout"] = clean_stdout
-            result["stderr"] = stderr_combined.strip() or "Процесс завершился нештатно."
+            result = self._parse_result(result, clean_stdout, stderr_combined.strip() or "Процесс завершился нештатно.", success=False)
 
         # Проверяем, существует ли output файл
-        if Path(output_path_abs).exists():
-            print(f"[CodeExecutor] ✅ Файл создан: {output_path_abs}")
+        if Path(output_path).exists():
+            print(f"[CodeExecutor] ✅ Файл создан: {output_path}")
         else:
-            print(f"[CodeExecutor] ❌ Файл НЕ создан: {output_path_abs}")
+            print(f"[CodeExecutor] ❌ Файл НЕ создан: {output_path}")
             result["stderr"] += "\n[WARNING] Файл результата не был создан по указанному пути."
 
+        return result
+
+    def _execute_in_docker(self, code: str, config_json: str, input_path_abs: str, output_path_abs: str, result: dict) -> dict:
+        """
+        Выполнить код в Docker-контейнере с полной изоляцией:
+        - Без сети (--network none)
+        - Только чтение (--read-only)
+        - Лимит RAM 512m, CPU 1 ядро
+        - Без привилегий (--cap-drop ALL)
+        - Монтируются только downloads/ и processed/
+
+        На Windows: Docker Desktop монтирует Windows-пути (E:\\...) в Linux-контейнер.
+        Внутри контейнера они видны как /data/downloads, /data/processed.
+        """
+        CONTAINER_MOUNT = "/data"
+        output_path = result["output_path"]
+
+        print(f"[CodeExecutor] Режим: Docker-контейнер ({DOCKER_SANDBOX_IMAGE})")
+        print(f"[CodeExecutor] input={input_path_abs}")
+        print(f"[CodeExecutor] output={output_path_abs}")
+
+        # Конвертируем Windows-пути в Linux-пути внутри контейнера
+        input_filename = Path(input_path_abs).name
+        output_filename = Path(output_path_abs).name
+        container_input = f"{CONTAINER_MOUNT}/downloads/{input_filename}"
+        container_output = f"{CONTAINER_MOUNT}/processed/{output_filename}"
+        container_download_dir = f"{CONTAINER_MOUNT}/downloads"
+        container_processed_dir = f"{CONTAINER_MOUNT}/processed"
+
+        # Генерируем конфиг для sandbox с Linux-путями внутри контейнера
+        container_cfg = {
+            "download_dir": container_download_dir,
+            "processed_dir": container_processed_dir,
+            "input_path": container_input,
+            "output_path": container_output,
+            "output_dir": f"{CONTAINER_MOUNT}/processed",
+        }
+        container_config_json = json.dumps(container_cfg)
+
+        print(f"[CodeExecutor] container_input={container_input}")
+        print(f"[CodeExecutor] container_output={container_output}")
+
+        # ════════════════════════════════════════════════════════════════
+        # Вместо stdin (ломается на Windows → cp1252 vs UTF-8)
+        # пишем ТОЛЬКО конфиг + код пользователя в файл.
+        # Bootstrap выполняется через -c, читает файл через sys.argv[1].
+        # ════════════════════════════════════════════════════════════════
+        script_id = uuid.uuid4().hex
+        script_rel = f"_sandbox_{script_id}.py"
+        script_host = Path(self._processed_dir) / script_rel
+        script_container = f"{CONTAINER_MOUNT}/processed/{script_rel}"
+
+        # Файл: строка 1 = JSON-конфиг, остальное = код пользователя
+        script_host.write_text(
+            container_config_json + "\n" + code,
+            encoding="utf-8",
+        )
+        print(f"[CodeExecutor] script_host={script_host}")
+
+        # docker run ... image -c "BOOTSTRAP" /data/processed/_sandbox_X.py
+        # ENTRYPOINT ["python"] подставится автоматически:
+        # → python -c "BOOTSTRAP" /data/processed/_sandbox_X.py
+        docker_cmd = ["docker", "run"] + DOCKER_RUN_ARGS + [
+            "-v", f"{self._download_dir}:{CONTAINER_MOUNT}/downloads:ro",
+            "-v", f"{self._processed_dir}:{CONTAINER_MOUNT}/processed",
+            DOCKER_SANDBOX_IMAGE,
+            "-c", _SANDBOX_BOOTSTRAP_FILE,
+            script_container,
+        ]
+
+        try:
+            proc = subprocess.Popen(
+                docker_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            # stdind не используется — всё через файл
+            stdout_raw_bytes, stderr_raw_bytes = proc.communicate(timeout=120)
+            stdout_raw = stdout_raw_bytes.decode("utf-8", errors="replace")
+            stderr_raw = stderr_raw_bytes.decode("utf-8", errors="replace")
+            print(f"[CodeExecutor] Docker stdout ({len(stdout_raw)} chars)")
+            print(f"[CodeExecutor] Docker stderr ({len(stderr_raw)} chars): {stderr_raw[:500]}")
+
+        except FileNotFoundError:
+            result["stderr"] = "❌ Docker не найден. Установите Docker Desktop или отключите DOCKER_ENABLED в .env"
+            return result
+        except subprocess.TimeoutExpired:
+            subprocess.run(["docker", "stop", "-t", "0"], capture_output=True)
+            stdout_raw, stderr_raw = "", ""
+            return self._parse_result(result, "", stderr_raw or "",
+                                       extra_stderr="\n⏱️ Превышено время выполнения кода (120 сек). Контейнер остановлен.",
+                                       success=False)
+        except Exception as e:
+            result["stderr"] = f"❌ Ошибка Docker: {type(e).__name__}: {e}"
+            return result
+
+        # Парсим результат
+        stdout_lines = stdout_raw.split("\n")
+        stderr_combined = stderr_raw or ""
+        success_marker = "__EXIT_SUCCESS__"
+        failure_marker = "__EXIT_FAILURE__"
+
+        clean_stdout_lines = [l for l in stdout_lines if l not in (success_marker, failure_marker)]
+        clean_stdout = "\n".join(clean_stdout_lines).strip()
+
+        if success_marker in stdout_raw:
+            result = self._parse_result(result, clean_stdout, stderr_combined.strip(), success=True)
+        elif failure_marker in stdout_raw:
+            result = self._parse_result(result, clean_stdout, stderr_combined.strip() or "Код завершился с ошибкой.", success=False)
+        else:
+            result = self._parse_result(result, clean_stdout, stderr_combined.strip() or "Контейнер завершился нештатно.", success=False)
+
+        # Проверяем output-файл (создан внутри контейнера по /data/processed/..., 
+        # но на хосте виден как Windows-путь)
+        if Path(output_path).exists():
+            print(f"[CodeExecutor] ✅ Файл создан: {output_path}")
+        else:
+            print(f"[CodeExecutor] ❌ Файл НЕ создан: {output_path}")
+            result["stderr"] += "\n[WARNING] Файл результата не был создан по указанному пути."
+
+        return result
+
+    @staticmethod
+    def _parse_result(result: dict, stdout: str, stderr: str, success: bool, extra_stderr: str = "") -> dict:
+        """Заполнить результат выполнения."""
+        result["success"] = success
+        result["stdout"] = stdout
+        result["stderr"] = stderr + extra_stderr
         return result
 
     def analyze_file(self, file_path: str) -> dict:

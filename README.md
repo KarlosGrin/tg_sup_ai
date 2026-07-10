@@ -52,15 +52,53 @@
     python main.py
     ```
 
+## � Docker-изоляция песочницы (рекомендуется для production)
+
+Проект поддерживает два режима выполнения пользовательского кода:
+
+### Режим 1: прямой subprocess (по умолчанию, `DOCKER_ENABLED=false`)
+- Код выполняется в отдельном Python-процессе на хосте
+- Защита: ограниченные builtins, блок-лист паттернов, таймаут 120с
+- **Не является полной изоляцией** — MRO-джейлбрейк теоретически возможен
+
+### Режим 2: Docker-контейнер (`DOCKER_ENABLED=true`)
+- Код выполняется в изолированном контейнере с параметрами:
+  - `--network none` — без доступа к сети
+  - `--read-only` — файловая система только для чтения
+  - `--memory=512m --cpus=1` — лимиты ресурсов
+  - `--cap-drop ALL` — без привилегий
+  - `--security-opt no-new-privileges:true` — запрет повышения прав
+- **Настройка Docker:**
+  1. Установите [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+  2. Соберите sandbox-образ:
+     ```bash
+     docker compose build sandbox
+     ```
+  3. В `.env` установите `DOCKER_ENABLED=true`
+
+### Запуск всего проекта в Docker (опционально)
+```bash
+docker compose up bot --build
+```
+
 ## 📄 Конфигурация
 
-Все настройки хранятся в файле `config.py`, который не отслеживается системой контроля версий (см. `.gitignore`).
+Все настройки хранятся в файле `config.py`, который читает переменные из `.env` через `python-dotenv`.
 
-- `AI_PROVIDER`: Выбор между `'gemini'` и `'openai'`.
-- `GEMINI_API_KEY` / `OPENAI_API_KEY`: Ваш ключ для соответствующего AI-сервиса.
-- `TELEGRAM_BOT_TOKEN`: Токен, полученный от @BotFather.
-- `ADMIN_IDS`: Список ID пользователей Telegram, которые имеют права администратора.
+| Переменная | Описание | По умолчанию |
+|---|---|---|
+| `BOT_TOKEN` | Токен Telegram-бота (от @BotFather) | — |
+| `AI_PROVIDER` | Провайдер AI: `openai` или `gemini` | `openai` |
+| `GEMINI_API_KEY` | Ключ Gemini API | — |
+| `OPENAI_API_KEY` | Ключ OpenAI API | — |
+| `ADMIN_IDS` | ID администраторов (через запятую) | — |
+| `CHANNEL_ID` | ID канала Telegram | `-1004469769190` |
+| `DOCKER_ENABLED` | Использовать Docker-изоляцию | `false` |
+
+Полный список — в файле `.env.example`.
 
 ## ⚠️ Важно
 
-Никогда не публикуйте файл `config.py` и не передавайте его третьим лицам. Он содержит ваши секретные ключи.
+- Никогда не публикуйте файл `.env` и `config.py` — они содержат секретные ключи.
+- Никогда не редактируйте `config_template.py` — он отслеживается git, и реальные ключи в нём утекут в публичный репозиторий.
+- Для production-безопасности **обязательно включите `DOCKER_ENABLED=true`**.

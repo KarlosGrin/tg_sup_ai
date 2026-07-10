@@ -217,11 +217,11 @@ class GeminiAssistant:
 - `output_dir` — директория для сохранения (НЕ создавай свою переменную)
 - `pd` / `pandas` — уже импортирован
 - `np` / `numpy` — уже импортирован
-- `os` / `os.path` — уже доступен
+- `pathlib.Path` — уже импортирован (используй для работы с путями)
 
 НЕ ПИШИ: `input_path = "..."` или `output_path = "..."` — используй готовые переменные.
 НЕ ПИШИ: `import pandas as pd` — pd уже есть.
-НЕ ПИШИ: `import os` — os уже доступен.
+НЕ ПИШИ: `import os` — модуль os НЕ ДОСТУПЕН по соображениям безопасности.
 
 ПРАВИЛЬНО: `df = pd.read_excel(input_path)`
 ПРАВИЛЬНО: `df.to_excel(output_path, index=False)`

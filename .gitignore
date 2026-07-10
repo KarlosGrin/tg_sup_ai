@@ -37,3 +37,6 @@ config.py
 downloads/
 processed/
 *.log
+
+# Docker (опционально, если собираете образ локально)
+.sandbox-cache/

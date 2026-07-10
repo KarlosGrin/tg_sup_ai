@@ -1,0 +1,35 @@
+# ═══════════════════════════════════════════════════════════════
+# Docker Compose для проекта tg_sup_ai
+# ═══════════════════════════════════════════════════════════════
+# Использование:
+#   docker compose build sandbox    — собрать образ для песочницы
+#   docker compose up bot           — запустить бота (если нужен контейнер)
+# ═══════════════════════════════════════════════════════════════
+
+services:
+  # === Sandbox-образ для изолированного выполнения кода ===
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    image: tg_sup_ai-sandbox:latest
+    # Контейнер не запускается как сервис —
+    # образ используется code_executor.py через `docker run --rm`
+    profiles:
+      - donotstart
+
+  # === Telegram бот (опционально, можно запускать и без Docker) ===
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tg_sup_ai-bot:latest
+    env_file:
+      - .env
+    volumes:
+      # Монтируем директории для скачивания и обработки файлов
+      - ./downloads:/app/downloads
+      - ./processed:/app/processed
+    restart: unless-stopped
+    # sandbox-образ собирается отдельно: docker compose --profile donotstart build sandbox
+    # (сервис bot не зависит от запущенного sandbox-контейнера)
