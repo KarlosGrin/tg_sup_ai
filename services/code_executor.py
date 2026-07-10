@@ -329,10 +329,17 @@ _BLOCKED_PATTERNS = [
 class CodeExecutor:
     """Исполняет Python-код в отдельном процессе (subprocess или Docker-контейнер) с ограничениями."""
 
-    # Дандер-атрибуты, запрещённые на уровне AST (обход через конкатенацию строк)
-    _DANGEROUS_DUNDERS = frozenset({
-        "__subclasses__", "__bases__", "__mro__",
-        "__globals__", "__code__", "__reduce__", "__reduce_ex__",
+    # ✅ Whitelist разрешённых dunder-атрибутов.
+    # Любой другой __attr__ блокируется на уровне AST
+    # (это закрывает обходы через конкатенацию строк, getattr, __getattribute__).
+    _ALLOWED_DUNDERS = frozenset({
+        "__class__", "__name__", "__dict__", "__init__",
+        "__str__", "__repr__", "__len__", "__iter__",
+        "__next__", "__getitem__", "__setitem__",
+        "__enter__", "__exit__", "__contains__",
+        "__add__", "__sub__", "__mul__", "__truediv__",
+        "__eq__", "__ne__", "__lt__", "__gt__", "__le__", "__ge__",
+        "__hash__", "__bool__", "__call__",
     })
 
     def __init__(self):
@@ -342,80 +349,85 @@ class CodeExecutor:
         self._docker_enabled = getattr(_cfg, 'DOCKER_ENABLED', True)
         self._execution_timeout = getattr(_cfg, 'EXECUTION_TIMEOUT', 120)
 
+    @staticmethod
+    def _is_dunder(name: str) -> bool:
+        """Проверить, является ли имя dunder-атрибутом (__xxx__)."""
+        return name.startswith("__") and name.endswith("__") and len(name) > 4
+
+    @staticmethod
+    def _constant_propagate(tree: ast.AST) -> dict[str, str]:
+        """
+        Простой constant propagation: собирает присваивания вида
+            var = 'строка'
+        и возвращает словарь {имя_переменной: значение}.
+        """
+        const_map: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    var_name = node.targets[0].id
+                    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                        const_map[var_name] = node.value.value
+        return const_map
+
     def _check_code_ast(self, code: str) -> Optional[str]:
         """
-        AST-анализ кода: обнаруживает опасные атрибуты (__subclasses__, __bases__ и т.д.),
-        даже если их имя собрано через конкатенацию строк.
-        Дополняет substring-based _check_blocked_patterns.
+        AST-анализ кода с whitelist-подходом:
+        - Блокирует ЛЮБОЙ dunder-атрибут (__xxx__), кроме _ALLOWED_DUNDERS
+        - Сканирует все строковые константы и атрибуты
+        - Использует constant propagation для отслеживания значений переменных
         """
         try:
             tree = ast.parse(code)
         except SyntaxError:
-            # Невалидный Python — sandbox отловит на exec()
             return None
 
-        for node in ast.walk(tree):
-            # getattr(base, name) — атака через разбивку строки
-            if isinstance(node, ast.Call):
-                func = node.func
-                # getattr(x, 'опасная_строка')
-                if isinstance(func, ast.Name) and func.id == "getattr":
-                    if len(node.args) >= 2:
-                        attr_arg = node.args[1]
-                        if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
-                            if attr_arg.value in self._DANGEROUS_DUNDERS:
-                                return f"⛔ AST: запрещён доступ к атрибуту '{attr_arg.value}'"
+        const_map = self._constant_propagate(tree)
 
-            # object.__subclasses__() — прямой вызов через конкатенацию строк
-            # (например, ().__class__.__bases__[0].__subcla + 'sses__' — не ловится AST,
-            #  но ловится через getattr. Конкатенация литералов Python склеивает их
-            #  ДО парсинга в байткод, но в AST это остаётся BinOp!)
+        # 1. Сканируем ВСЕ строковые константы на dunder-паттерны
+        #    (ловит '.__subcla' 'sses__' → единый Constant('__subclasses__'))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                val = node.value
+                # Ищем любой dunder-паттерн в строке
+                import re
+                for match in re.finditer(r'__[a-zA-Z_]\w+__', val):
+                    dunder = match.group()
+                    if self._is_dunder(dunder) and dunder not in self._ALLOWED_DUNDERS:
+                        return f"⛔ AST: строковая константа содержит запрещённый dunder '{dunder}'"
+
+        # 2. Сканируем все атрибуты (obj.__xxx__)
+        for node in ast.walk(tree):
             if isinstance(node, ast.Attribute):
-                if node.attr in self._DANGEROUS_DUNDERS:
+                if self._is_dunder(node.attr) and node.attr not in self._ALLOWED_DUNDERS:
                     return f"⛔ AST: запрещён доступ к атрибуту '{node.attr}'"
 
-            # obj.__getattribute__('__subclasses__') — обход через __getattribute__
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Attribute) and func.attr == "__getattribute__":
-                    if len(node.args) >= 1:
-                        arg = node.args[0]
-                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                            if arg.value in self._DANGEROUS_DUNDERS:
-                                return f"⛔ AST: запрещён __getattribute__('{arg.value}')"
-
-        # Дополнительно: проверка конкатенации строковых литералов
-        # "".__cla + "ss__" → в AST это BinOp(left=Constant('__cla'), right=Constant('ss__'))
+        # 3. Сканируем getattr(obj, ...) — с constant propagation
         for node in ast.walk(tree):
-            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-                # Проверяем левую и правую части
-                for child in (node.left, node.right):
-                    if isinstance(child, ast.Constant) and isinstance(child.value, str):
-                        # Собираем все конкатенированные строки
-                        combined = self._collect_string_concat(node)
-                        if combined:
-                            for dunder in self._DANGEROUS_DUNDERS:
-                                if dunder in combined:
-                                    return f"⛔ AST: обнаружена конкатенация строк, содержащая '{dunder}'"
-        return None
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
+                if len(node.args) >= 2:
+                    arg = node.args[1]
+                    val = None
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        val = arg.value
+                    elif isinstance(arg, ast.Name) and arg.id in const_map:
+                        val = const_map[arg.id]
+                    if val and self._is_dunder(val) and val not in self._ALLOWED_DUNDERS:
+                        return f"⛔ AST: getattr() с запрещённым dunder '{val}'"
 
-    @staticmethod
-    def _collect_string_concat(node: ast.AST, seen: set | None = None) -> str | None:
-        """Собрать все константные строки из цепочки BinOp(+) в одну строку."""
-        if seen is None:
-            seen = set()
-        node_id = id(node)
-        if node_id in seen:
-            return None
-        seen.add(node_id)
+        # 4. Сканируем obj.__getattribute__('...')
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "__getattribute__":
+                if len(node.args) >= 1:
+                    arg = node.args[0]
+                    val = None
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        val = arg.value
+                    elif isinstance(arg, ast.Name) and arg.id in const_map:
+                        val = const_map[arg.id]
+                    if val and self._is_dunder(val) and val not in self._ALLOWED_DUNDERS:
+                        return f"⛔ AST: __getattribute__() с запрещённым dunder '{val}'"
 
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left = CodeExecutor._collect_string_concat(node.left, seen)
-            right = CodeExecutor._collect_string_concat(node.right, seen)
-            if left is not None and right is not None:
-                return left + right
         return None
 
     def _check_blocked_patterns(self, code: str) -> Optional[str]:

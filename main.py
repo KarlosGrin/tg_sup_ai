@@ -23,7 +23,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
 from config import config
-from handlers.message_handler import router
+from handlers.message_handler import router, _cleanup_stale_entries
 from services.file_service import file_service
 
 # Настройка логирования
@@ -91,6 +91,22 @@ async def on_startup(bot: Bot):
 
     logger.info("Бот успешно запущен и готов к работе!")
     logger.info("=" * 50)
+
+    # Запуск фоновой задачи очистки мёртвых записей (каждый час)
+    asyncio.create_task(_periodic_cleanup())
+
+
+async def _periodic_cleanup():
+    """Фоновая задача: очистка rate-limit и сессий раз в час."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # 1 час
+            _cleanup_stale_entries()
+            logger.info("🧹 Фоновая очистка мёртвых записей выполнена")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка фоновой очистки: {e}")
 
 
 async def on_shutdown(bot: Bot):
