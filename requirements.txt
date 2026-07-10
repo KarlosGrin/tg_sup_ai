@@ -8,3 +8,4 @@ numpy==2.5.1
 google-genai==2.11.0
 openai==2.45.0
 python-dotenv==1.2.2
+tenacity==9.1.4

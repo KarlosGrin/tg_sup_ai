@@ -3,11 +3,15 @@ AI сервис для взаимодействия с Gemini/OpenAI API и ге
 """
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Optional
 
+import tenacity
 from config import config
+
+logger = logging.getLogger(__name__)
 
 
 # Системный промпт для AI — загружается из внешнего файла
@@ -16,6 +20,36 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT_PATH.read_text(encoding="utf-8") if _SYSTEM_PROMP
 
 if not SYSTEM_PROMPT:
     SYSTEM_PROMPT = "### [РОЛЬ]\nТы — Senior Data Analyst. Обрабатывай Excel/CSV/Word/TXT.\n### [ФОРМАТ]\nВерни JSON: analysis, code, explanation\n"
+
+
+# Общие настройки retry для AI API вызовов
+_AI_RETRY_CONFIG = {
+    "stop": tenacity.stop_after_attempt(3),
+    "wait": tenacity.wait_exponential(multiplier=1, min=1, max=8),
+    "reraise": False,
+    "before_sleep": tenacity.before_sleep_log(logger, logging.WARNING),
+}
+
+
+def _is_retryable_openai(exc: BaseException) -> bool:
+    """Только сетевые ошибки/5xx/429 — retry-able."""
+    import openai
+    return isinstance(exc, (
+        openai.RateLimitError,
+        openai.APITimeoutError,
+        openai.APIConnectionError,
+        openai.InternalServerError,
+    ))
+
+
+def _is_retryable_gemini(exc: BaseException) -> bool:
+    """Только сетевые ошибки/5xx/429 — retry-able."""
+    import google.api_core.exceptions as google_exc
+    return isinstance(exc, (
+        google_exc.ResourceExhausted,
+        google_exc.ServiceUnavailable,
+        google_exc.DeadlineExceeded,
+    ))
 
 
 class AIService:
@@ -31,14 +65,14 @@ class AIService:
             from google import genai
             self._gemini_client = genai.Client(api_key=config.GEMINI_API_KEY)
             self._gemini_model = config.GEMINI_MODEL
-            print(f"[AI] Используется Gemini: {self._gemini_model}")
+            logger.info("Используется Gemini: %s", self._gemini_model)
         else:
             from openai import OpenAI
             self._openai_client = OpenAI(api_key=config.OPENAI_API_KEY)
             self._openai_model = config.OPENAI_MODEL
             self._openai_max_tokens = config.OPENAI_MAX_TOKENS
             self._openai_temperature = config.OPENAI_TEMPERATURE
-            print(f"[AI] Используется OpenAI: {self._openai_model}")
+            logger.info("Используется OpenAI: %s", self._openai_model)
 
     def _build_prompt(self, user_command: str, file_summaries: list[str],
                       input_path: str, output_path: str) -> str:
@@ -65,39 +99,67 @@ class AIService:
 
 Сгенерируй Python-код для выполнения задачи."""
 
-    def _call_gemini(self, prompt: str, json_mode: bool = True) -> Optional[str]:
-        """Вызов Gemini API."""
-        try:
-            config_dict = {}
-            if json_mode:
-                config_dict["response_mime_type"] = "application/json"
+    # ═══════════════════════════════════════════════════════
+    # Retry-обёртка: tenacity для сетевых ошибок/5xx/429
+    # ═══════════════════════════════════════════════════════
 
-            response = self._gemini_client.models.generate_content(
-                model=self._gemini_model,
-                contents=prompt,
-                config=config_dict,
-            )
-            return response.text
+    @tenacity.retry(
+        stop=_AI_RETRY_CONFIG["stop"],
+        wait=_AI_RETRY_CONFIG["wait"],
+        retry=tenacity.retry_if_exception(_is_retryable_gemini),
+        before_sleep=_AI_RETRY_CONFIG["before_sleep"],
+    )
+    def _call_gemini_retried(self, prompt: str, json_mode: bool = True) -> str:
+        """Gemini-вызов с tenacity (только retry-able ошибки)."""
+        config_dict = {}
+        if json_mode:
+            config_dict["response_mime_type"] = "application/json"
+        response = self._gemini_client.models.generate_content(
+            model=self._gemini_model,
+            contents=prompt,
+            config=config_dict,
+        )
+        text = response.text
+        if text is None:
+            raise ValueError("Gemini returned empty response")
+        return text
+
+    def _call_gemini(self, prompt: str, json_mode: bool = True) -> Optional[str]:
+        """Вызов Gemini API + retry + fallback для не-retryable ошибок."""
+        try:
+            return self._call_gemini_retried(prompt, json_mode=json_mode)
         except Exception as e:
-            print(f"[AI Gemini Error] {e}")
+            logger.error("Gemini error: %s: %s", type(e).__name__, e)
             return None
 
-    def _call_openai(self, prompt: str, json_mode: bool = True) -> Optional[str]:
-        """Вызов OpenAI API."""
-        try:
-            kwargs = {
-                "model": self._openai_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": self._openai_max_tokens,
-                "temperature": self._openai_temperature,
-            }
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
+    @tenacity.retry(
+        stop=_AI_RETRY_CONFIG["stop"],
+        wait=_AI_RETRY_CONFIG["wait"],
+        retry=tenacity.retry_if_exception(_is_retryable_openai),
+        before_sleep=_AI_RETRY_CONFIG["before_sleep"],
+    )
+    def _call_openai_retried(self, prompt: str, json_mode: bool = True) -> str:
+        """OpenAI-вызов с tenacity (только retry-able ошибки)."""
+        kwargs = {
+            "model": self._openai_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self._openai_max_tokens,
+            "temperature": self._openai_temperature,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = self._openai_client.chat.completions.create(**kwargs)
+        content = response.choices[0].message.content
+        if content is None:
+            raise ValueError("OpenAI returned empty response")
+        return content
 
-            response = self._openai_client.chat.completions.create(**kwargs)
-            return response.choices[0].message.content
+    def _call_openai(self, prompt: str, json_mode: bool = True) -> Optional[str]:
+        """Вызов OpenAI API + retry + fallback для не-retryable ошибок."""
+        try:
+            return self._call_openai_retried(prompt, json_mode=json_mode)
         except Exception as e:
-            print(f"[AI OpenAI Error] {e}")
+            logger.error("OpenAI error: %s: %s", type(e).__name__, e)
             return None
 
     def generate_code(
@@ -122,16 +184,16 @@ class AIService:
                 raw = self._call_openai(prompt, json_mode=True)
 
             if not raw:
-                print("[AI Service Error] Пустой ответ от AI")
+                logger.warning("Пустой ответ от AI")
                 return None
 
             parsed = self._parse_response(raw.strip())
             if parsed is None:
-                print(f"[AI Service Error] Не удалось распарсить ответ AI")
+                logger.warning("Не удалось распарсить ответ AI")
             return parsed
 
         except Exception as e:
-            print(f"[AI Service Error] {type(e).__name__}: {e}")
+            logger.error("AI generate_code error: %s: %s", type(e).__name__, e)
             return None
 
     def chat_direct(
@@ -208,7 +270,7 @@ class AIService:
             except json.JSONDecodeError:
                 pass
 
-        print(f"[AI Parse Error] Не удалось распарсить ответ: {content[:300]}")
+        logger.warning("Не удалось распарсить ответ AI: %.300s", content)
         return None
 
 

@@ -6,6 +6,7 @@
 
 import ast
 import json
+import logging
 import subprocess
 import sys
 import textwrap
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -531,7 +534,7 @@ class CodeExecutor:
         """
         output_path = result["output_path"]
 
-        print(f"[CodeExecutor] Режим: прямой subprocess (cwd={Path.cwd()})")
+        logger.info("Режим: прямой subprocess (cwd=%s)", Path.cwd())
 
         proc = subprocess.Popen(
             [sys.executable, "-c", _SANDBOX_BOOTSTRAP],
@@ -545,8 +548,8 @@ class CodeExecutor:
         try:
             input_data = config_json + "\n" + code
             stdout_raw, stderr_raw = proc.communicate(input=input_data, timeout=self._execution_timeout)
-            print(f"[CodeExecutor] stdout ({len(stdout_raw)} chars)")
-            print(f"[CodeExecutor] stderr ({len(stderr_raw)} chars): {stderr_raw[:500]}")
+            logger.info("stdout (%d chars)", len(stdout_raw))
+            logger.info("stderr (%d chars): %s", len(stderr_raw), stderr_raw[:500])
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_raw, stderr_raw = proc.communicate()
@@ -570,9 +573,9 @@ class CodeExecutor:
 
         # Проверяем, существует ли output файл
         if Path(output_path).exists():
-            print(f"[CodeExecutor] ✅ Файл создан: {output_path}")
+            logger.info("✅ Файл создан: %s", output_path)
         else:
-            print(f"[CodeExecutor] ❌ Файл НЕ создан: {output_path}")
+            logger.warning("❌ Файл НЕ создан: %s", output_path)
             result["stderr"] += "\n[WARNING] Файл результата не был создан по указанному пути."
 
         return result
@@ -592,9 +595,9 @@ class CodeExecutor:
         CONTAINER_MOUNT = "/data"
         output_path = result["output_path"]
 
-        print(f"[CodeExecutor] Режим: Docker-контейнер ({DOCKER_SANDBOX_IMAGE})")
-        print(f"[CodeExecutor] input={input_path_abs}")
-        print(f"[CodeExecutor] output={output_path_abs}")
+        logger.info("Режим: Docker-контейнер (%s)", DOCKER_SANDBOX_IMAGE)
+        logger.info("input=%s", input_path_abs)
+        logger.info("output=%s", output_path_abs)
 
         # Конвертируем Windows-пути в Linux-пути внутри контейнера
         # Теперь файлы лежат в user-подпапках: downloads/<user_id>/file, processed/<user_id>/file
@@ -624,8 +627,8 @@ class CodeExecutor:
         }
         container_config_json = json.dumps(container_cfg)
 
-        print(f"[CodeExecutor] container_input={container_input}")
-        print(f"[CodeExecutor] container_output={container_output}")
+        logger.info("container_input=%s", container_input)
+        logger.info("container_output=%s", container_output)
 
         # ════════════════════════════════════════════════════════════════
         # Вместо stdin (ломается на Windows → cp1252 vs UTF-8)
@@ -642,7 +645,7 @@ class CodeExecutor:
             container_config_json + "\n" + code,
             encoding="utf-8",
         )
-        print(f"[CodeExecutor] script_host={script_host}")
+        logger.info("script_host=%s", script_host)
 
         # docker run ... image -c "BOOTSTRAP" /data/processed/_sandbox_X.py
         # ENTRYPOINT ["python"] подставится автоматически:
@@ -666,8 +669,8 @@ class CodeExecutor:
             stdout_raw_bytes, stderr_raw_bytes = proc.communicate(timeout=self._execution_timeout)
             stdout_raw = stdout_raw_bytes.decode("utf-8", errors="replace")
             stderr_raw = stderr_raw_bytes.decode("utf-8", errors="replace")
-            print(f"[CodeExecutor] Docker stdout ({len(stdout_raw)} chars)")
-            print(f"[CodeExecutor] Docker stderr ({len(stderr_raw)} chars): {stderr_raw[:500]}")
+            logger.info("Docker stdout (%d chars)", len(stdout_raw))
+            logger.info("Docker stderr (%d chars): %s", len(stderr_raw), stderr_raw[:500])
 
         except FileNotFoundError:
             result["stderr"] = "❌ Docker не найден. Установите Docker Desktop или отключите DOCKER_ENABLED в .env"
@@ -701,9 +704,9 @@ class CodeExecutor:
         # Проверяем output-файл (создан внутри контейнера по /data/processed/..., 
         # но на хосте виден как Windows-путь)
         if Path(output_path).exists():
-            print(f"[CodeExecutor] ✅ Файл создан: {output_path}")
+            logger.info("✅ Docker: файл создан: %s", output_path)
         else:
-            print(f"[CodeExecutor] ❌ Файл НЕ создан: {output_path}")
+            logger.warning("❌ Docker: файл НЕ создан: %s", output_path)
             result["stderr"] += "\n[WARNING] Файл результата не был создан по указанному пути."
 
         return result

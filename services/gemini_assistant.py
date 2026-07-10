@@ -10,6 +10,7 @@ Gemini читает файл через File API и генерирует Python-
 """
 
 import asyncio
+import logging
 import os
 import json
 import tempfile
@@ -17,7 +18,20 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import tenacity
 from config import config
+
+logger = logging.getLogger(__name__)
+
+
+def _is_retryable_gemini(exc: BaseException) -> bool:
+    """Определяет, можно ли повторить Gemini запрос при этой ошибке."""
+    import google.api_core.exceptions as google_exc
+    return isinstance(exc, (
+        google_exc.ResourceExhausted,
+        google_exc.ServiceUnavailable,
+        google_exc.DeadlineExceeded,
+    ))
 
 
 # Системный промпт для AI — загружается из внешнего файла
@@ -36,7 +50,7 @@ class GeminiAssistant:
         self.client = genai.Client(api_key=config.GEMINI_API_KEY)
         self.model = config.GEMINI_MODEL
         self._tmp_files: list[str] = []
-        print(f"[GeminiAssistant] Гибридный режим, модель: {self.model}")
+        logger.info("Гибридный режим, модель: %s", self.model)
 
     async def execute(self, code: str, input_path: str, output_path: str, user_command: str = "") -> dict:
         """
@@ -119,22 +133,33 @@ class GeminiAssistant:
         prompt = self._build_prompt(file_name, file_uri, input_path, output_path, user_command)
 
         try:
-            response = await asyncio.to_thread(
-                lambda: self.client.models.generate_content(
+            # Retry-обёртка для Gemini API вызова
+            @tenacity.retry(
+                stop=tenacity.stop_after_attempt(3),
+                wait=tenacity.wait_exponential(multiplier=1, min=1, max=8),
+                retry=tenacity.retry_if_exception(
+                    lambda e: _is_retryable_gemini(e)
+                ),
+                before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
+                reraise=True,
+            )
+            def _call_gemini():
+                return self.client.models.generate_content(
                     model=self.model,
                     contents=prompt,
                     config={"response_mime_type": "application/json"},
                 )
-            )
+
+            response = await asyncio.to_thread(_call_gemini)
 
             if not response or not response.text:
-                print("[GeminiAssistant] Пустой ответ от Gemini")
+                logger.warning("Пустой ответ от Gemini")
                 return None
 
             raw = response.text.strip()
             parsed = self._parse_response(raw)
             if parsed is None:
-                print(f"[GeminiAssistant] Не удалось распарсить JSON")
+                logger.warning("Не удалось распарсить JSON ответ Gemini")
                 # Пробуем извлечь код из markdown
                 code_match = re.search(r"```python\n(.*?)\n```", raw, re.DOTALL)
                 if code_match:
@@ -147,7 +172,7 @@ class GeminiAssistant:
             return parsed
 
         except Exception as e:
-            print(f"[GeminiAssistant] Gemini call error: {type(e).__name__}: {e}")
+            logger.error("Gemini call error: %s: %s", type(e).__name__, e)
             return None
 
     # ----------------------------------------------------------------
@@ -158,10 +183,10 @@ class GeminiAssistant:
         """Загрузить файл в Gemini File API (async), вернуть URI."""
         try:
             file_path_resolved = str(Path(file_path).resolve())
-            print(f"[GeminiAssistant] Загрузка файла: {file_path_resolved}")
+            logger.info("Загрузка файла: %s", file_path_resolved)
 
             if not Path(file_path_resolved).exists():
-                print(f"[GeminiAssistant] Файл не найден: {file_path_resolved}")
+                logger.warning("Файл не найден: %s", file_path_resolved)
                 return None
 
             file = await asyncio.to_thread(
@@ -175,14 +200,14 @@ class GeminiAssistant:
                 )
 
             if file.state.name == "FAILED":
-                print(f"[GeminiAssistant] Ошибка загрузки: {file.state.name}")
+                logger.warning("Ошибка загрузки: %s", file.state.name)
                 return None
 
-            print(f"[GeminiAssistant] Файл загружен: {file.uri}")
+            logger.info("Файл загружен: %s", file.uri)
             return file.uri
 
         except Exception as e:
-            print(f"[GeminiAssistant] Ошибка upload: {type(e).__name__}: {e}")
+            logger.error("Ошибка upload: %s: %s", type(e).__name__, e)
             return None
 
     # ----------------------------------------------------------------
@@ -267,7 +292,7 @@ class GeminiAssistant:
             except json.JSONDecodeError:
                 pass
 
-        print(f"[GeminiAssistant] Не удалось распарсить JSON")
+        logger.warning("Не удалось распарсить JSON ответ Gemini")
         return None
 
     # ----------------------------------------------------------------
@@ -289,7 +314,7 @@ class GeminiAssistant:
             self._tmp_files.append(tmp_path)
             return tmp_path
         except Exception as e:
-            print(f"[GeminiAssistant] Ошибка копирования: {e}")
+            logger.warning("Ошибка копирования: %s", e)
             return None
 
     def _cleanup_tmp(self):

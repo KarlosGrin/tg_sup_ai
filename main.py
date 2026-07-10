@@ -23,7 +23,12 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
 from config import config
-from handlers.message_handler import router, _cleanup_stale_entries
+from handlers.common import _cleanup_stale_entries
+from handlers.commands import router as commands_router
+from handlers.admin import router as admin_router
+from handlers.documents import router as documents_router
+from handlers.callbacks import router as callbacks_router
+from handlers.text import router as text_router
 from services.file_service import file_service
 
 # Настройка логирования
@@ -136,8 +141,12 @@ async def main():
     )
     dp = Dispatcher()
 
-    # Регистрируем роутер
-    dp.include_router(router)
+    # Регистрируем роутеры (порядок важен: специфичные → общие)
+    dp.include_router(commands_router)
+    dp.include_router(admin_router)
+    dp.include_router(documents_router)
+    dp.include_router(callbacks_router)
+    dp.include_router(text_router)
 
     # Регистрируем обработчики запуска/остановки
     dp.startup.register(on_startup)
