@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environment
+.env
+.venv
+env/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Secrets
+config.py
+
+# Data dirs (mounted as volumes at runtime)
+downloads/
+processed/
+
+# Logs
+*.log
+bot.log
+
+# Cache
+.sandbox-cache/
+.pytest_cache/
