@@ -10,6 +10,7 @@ from pathlib import Path
 import tenacity
 
 from config import config
+from services.profiler import ai_requests
 from utils.profiler_decorator import profiled
 
 logger = logging.getLogger(__name__)
@@ -129,9 +130,12 @@ class AIService:
     def _call_gemini(self, prompt: str, json_mode: bool = True) -> str | None:
         """Вызов Gemini API + retry + fallback для не-retryable ошибок."""
         try:
-            return self._call_gemini_retried(prompt, json_mode=json_mode)
+            result = self._call_gemini_retried(prompt, json_mode=json_mode)
+            ai_requests.labels(provider="gemini", status="ok").inc()
+            return result
         except Exception as e:
             logger.error("Gemini error: %s: %s", type(e).__name__, e)
+            ai_requests.labels(provider="gemini", status="error").inc()
             return None
 
     @profiled()
@@ -160,9 +164,12 @@ class AIService:
     def _call_openai(self, prompt: str, json_mode: bool = True) -> str | None:
         """Вызов OpenAI API + retry + fallback для не-retryable ошибок."""
         try:
-            return self._call_openai_retried(prompt, json_mode=json_mode)
+            result = self._call_openai_retried(prompt, json_mode=json_mode)
+            ai_requests.labels(provider="openai", status="ok").inc()
+            return result
         except Exception as e:
             logger.error("OpenAI error: %s: %s", type(e).__name__, e)
+            ai_requests.labels(provider="openai", status="error").inc()
             return None
 
     @profiled()

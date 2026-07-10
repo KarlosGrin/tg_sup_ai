@@ -15,6 +15,7 @@ from handlers.common import (
     _user_upload_times,
 )
 from services.file_service import file_service
+from services.profiler import files_uploaded
 from utils.keyboards import quick_actions_keyboard
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,9 @@ async def handle_document(message: Message, bot: Bot):
 
         session = _get_session(user_id)
         session["file_paths"].append(str(saved_path))
+
+        # Prometheus: считаем загруженные файлы по расширениям
+        files_uploaded.labels(ext=ext).inc()
 
         await status_msg.edit_text(f"🔍 Анализирую структуру <code>{file_name}</code>...", parse_mode="HTML")
         summary = file_service.get_file_summary(str(saved_path))

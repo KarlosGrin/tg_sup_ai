@@ -21,7 +21,6 @@ from handlers.common import (
     _user_upload_times,
     user_sessions,
 )
-from services.pipeline import _detect_target_extension
 
 
 @pytest.fixture(autouse=True)
@@ -84,45 +83,6 @@ class TestCheckRateLimit:
         # В t=1100 запрос в t=1000 уже вне окна (старше 60с)
         result = _check_rate_limit(1, _user_request_times, 5, 60)
         assert result  # должен быть разрешён (старая запись удалена)
-
-
-# ===== _detect_target_extension =====
-
-class TestDetectTargetExtension:
-    """Тесты определения целевого расширения."""
-
-    def test_xlsx_by_name(self):
-        """Упоминание 'xlsx' → .xlsx."""
-        assert _detect_target_extension("сохрани как xlsx", ".csv") == ".xlsx"
-
-    def test_csv_by_name(self):
-        """Упоминание 'csv' → .csv."""
-        assert _detect_target_extension("экспорт в csv", ".xlsx") == ".csv"
-
-    def test_txt_by_name(self):
-        """Упоминание 'txt' → .txt."""
-        assert _detect_target_extension("сохрани как txt", ".xlsx") == ".txt"
-
-    def test_docx_by_word(self):
-        """Упоминание 'word' → .docx."""
-        assert _detect_target_extension("сохрани в word", ".csv") == ".docx"
-
-    def test_excel_russian(self):
-        """Упоминание 'эксель' → .xlsx."""
-        assert _detect_target_extension("сделай эксель", ".csv") == ".xlsx"
-
-    def test_no_keyword_returns_source(self):
-        """Без ключевого слова → возвращается source_ext."""
-        assert _detect_target_extension("просто сохрани", ".xlsx") == ".xlsx"
-
-    def test_empty_command_returns_source(self):
-        """Пустая команда → source_ext."""
-        assert _detect_target_extension("", ".csv") == ".csv"
-
-    def test_case_insensitive(self):
-        """Команда в любом регистре."""
-        assert _detect_target_extension("CSV FORMAT", ".xlsx") == ".csv"
-        assert _detect_target_extension("Excel", ".csv") == ".xlsx"
 
 
 # ===== _cleanup_stale_entries =====

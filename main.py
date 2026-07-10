@@ -18,6 +18,7 @@
 
 import asyncio
 import sys
+import time
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -78,7 +79,7 @@ def _setup_logging() -> None:
         colorize=True,
     )
 
-    # File handler (с ротацией)
+    # File handler (текстовый, с ротацией)
     loguru_logger.add(
         config.LOG_FILE,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:^7} | {name}:{function}:{line} | {message}",
@@ -87,6 +88,18 @@ def _setup_logging() -> None:
         retention=config.LOG_RETENTION,
         encoding="utf-8",
         compression="gz",
+    )
+
+    # JSON handler (для Loki/ELK) — использует встроенную сериализацию loguru
+    loguru_logger.add(
+        "logs/bot.json",
+        format="{time:YYYY-MM-DDTHH:mm:ss.SSSSSS}Z | {level} | {name}:{function}:{line} | {message}",
+        level=config.LOG_LEVEL,
+        rotation="100 MB",
+        retention="7 days",
+        encoding="utf-8",
+        compression="gz",
+        serialize=True,
     )
 
     # Перехватываем стандартное logging → loguru
@@ -124,7 +137,7 @@ def _init_sentry() -> None:
             _sentry_initialized = True
             logger.info("🗼 Sentry инициализирован")
         except Exception as e:
-            logger.warning("⚠️ Не удалось инициализировать Sentry: {e}")
+            logger.warning("⚠️ Не удалось инициализировать Sentry: {}", e)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -132,23 +145,240 @@ def _init_sentry() -> None:
 # ════════════════════════════════════════════════════════════════
 
 _health_server = None
+_start_time = 0.0
+
+# ════════════════════════════════════════════════════════════════
+# HTML-шаблон дашборда (не f-string — %-formatting, чтобы избежать
+# конфликтов с { } в CSS и JavaScript)
+# ════════════════════════════════════════════════════════════════
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>tg_sup_ai — Dashboard</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117; color: #c9d1d9; padding: 2rem;
+        }
+        h1 { font-size:1.8rem; margin-bottom:.5rem; }
+        h2 { font-size:1.3rem; margin:1.5rem 0 .8rem; color: #58a6ff; }
+        .subtitle { color: #8b949e; margin-bottom:1.5rem; }
+        .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem; margin-bottom:2rem; }
+        .card {
+            background: #161b22; border:1px solid #30363d; border-radius:8px;
+            padding:1.2rem; text-align:center;
+        }
+        .card .label { font-size:.8rem; color:#8b949e; text-transform:uppercase; }
+        .card .value { font-size:1.8rem; font-weight:700; margin-top:.3rem; }
+        .card .value.green { color:#3fb950; }
+        .card .value.blue  { color:#58a6ff; }
+        .card .value.orange{ color:#d29922; }
+        table {
+            width:100%%; border-collapse:collapse; background:#161b22;
+            border:1px solid #30363d; border-radius:8px; overflow:hidden;
+        }
+        th, td { padding:.7rem 1rem; text-align:left; border-bottom:1px solid #21262d; }
+        th { background:#21262d; color:#8b949e; font-size:.8rem; text-transform:uppercase; }
+        td.val { text-align:right; font-family:monospace; font-weight:600; }
+        .links { margin-top:1.5rem; display:flex; gap:1rem; }
+        .links a {
+            color:#58a6ff; text-decoration:none; padding:.4rem .8rem;
+            border:1px solid #30363d; border-radius:6px; font-size:.9rem;
+        }
+        .links a:hover { background:#1f2937; }
+    </style>
+</head>
+<body>
+    <h1>&#x1F916; tg_sup_ai</h1>
+    <div class="subtitle">v1.0.0 &middot; Uptime: %s</div>
+
+    <div class="cards">
+        <div class="card">
+            <div class="label">AI Requests</div>
+            <div class="value blue" id="ai_reqs">&mdash;</div>
+        </div>
+        <div class="card">
+            <div class="label">Files Uploaded</div>
+            <div class="value green" id="files_up">&mdash;</div>
+        </div>
+        <div class="card">
+            <div class="label">Active Users</div>
+            <div class="value orange" id="active_users">&mdash;</div>
+        </div>
+        <div class="card">
+            <div class="label">Uptime</div>
+            <div class="value blue">%s</div>
+        </div>
+    </div>
+
+    <h2>&#x1F4CA; Prometheus Metrics</h2>
+    <table>
+        <thead><tr><th>Metric</th><th>Labels</th><th>Value</th></tr></thead>
+        <tbody>%s</tbody>
+    </table>
+
+    <h2>&#x1F50D; Health Checks</h2>
+    <table>
+        <thead><tr><th>Component</th><th>Status</th></tr></thead>
+        <tbody>%s</tbody>
+    </table>
+
+    <div class="links">
+        <a href="/metrics">&#x1F4C8; /metrics (Prometheus)</a>
+        <a href="/health">&#x1F49A; /health (JSON)</a>
+    </div>
+
+    <script>
+        fetch('/metrics').then(function(r) { return r.text(); }).then(function(text) {
+            function get(name) {
+                var re = new RegExp(name + '(?:\\\\{[^}]+\\\\})?\\\\s+([\\\\d.]+)');
+                var m = text.match(re);
+                return m ? parseFloat(m[1]) : 0;
+            }
+            document.getElementById('ai_reqs').textContent =
+                get('bot_ai_requests_total').toLocaleString();
+            document.getElementById('files_up').textContent =
+                get('bot_files_uploaded_total').toLocaleString();
+            document.getElementById('active_users').textContent =
+                get('bot_active_users').toLocaleString();
+        });
+    </script>
+</body>
+</html>"""
 
 
 async def _start_health_server() -> None:
     """Запуск FastAPI health/метрики сервера в фоне."""
     global _health_server
     try:
+        import time as _time
         import uvicorn
         from fastapi import FastAPI
-        from prometheus_client import make_asgi_app
+        from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+        from prometheus_client import make_asgi_app, REGISTRY
 
         app = FastAPI(title="tg_sup_ai Health", docs_url=None, redoc_url=None)
 
-        # Health check
+        # ════════════════════════════════════════════════════════════════
+        # Главная — редирект на дашборд
+        # ════════════════════════════════════════════════════════════════
+        @app.get("/")
+        async def root():
+            return RedirectResponse(url="/dashboard")
+
+        # ════════════════════════════════════════════════════════════════
+        # Дашборд — читаемая HTML-панель
+        # ════════════════════════════════════════════════════════════════
+        @app.get("/dashboard")
+        async def dashboard():
+            uptime_sec = _time.time() - _start_time if _start_time else 0
+            uptime_str = "%dh %dm %ds" % (
+                uptime_sec // 3600, (uptime_sec % 3600) // 60, uptime_sec % 60
+            )
+
+            # Собираем bot_* метрики
+            metric_rows = ""
+            for metric in REGISTRY.collect():
+                if not metric.name.startswith("bot_"):
+                    continue
+                for sample in metric.samples:
+                    if sample.name.endswith("_created") or sample.name.endswith("_bucket"):
+                        continue
+                    label_str = ", ".join("%s=%s" % (k, v) for k, v in sample.labels.items()) if sample.labels else ""
+                    metric_rows += "<tr><td><code>%s</code></td><td>%s</td><td class='val'>%.1f</td></tr>" % (
+                        sample.name, label_str, sample.value,
+                    )
+
+            # Проверки здоровья
+            checks = []
+            if config.REDIS_ENABLED:
+                try:
+                    from redis.asyncio import Redis
+                    r = Redis.from_url(config.REDIS_URL)
+                    await r.ping()
+                    await r.close()
+                    checks.append(("Redis", "\U0001f7e2 ok"))
+                except Exception:
+                    checks.append(("Redis", "\U0001f534 error"))
+            else:
+                checks.append(("Redis", "\u26aa disabled"))
+
+            checks.append(("Sentry", "\U0001f7e2 ok" if _sentry_initialized else ("\U0001f534 error" if config.SENTRY_ENABLED else "\u26aa disabled")))
+            checks.append(("Docker", "\U0001f7e2 enabled" if config.DOCKER_ENABLED else "\U0001f7e1 disabled"))
+            checks.append(("AI Provider", "\U0001f535 " + config.AI_PROVIDER))
+            checks.append(("Exec Mode", "\U0001f535 " + config.EXECUTION_MODE))
+
+            health_rows = "".join("<tr><td>%s</td><td>%s</td></tr>" % c for c in checks)
+
+            html = _DASHBOARD_HTML % (
+                uptime_str,
+                uptime_str,
+                metric_rows,
+                health_rows,
+            )
+            return HTMLResponse(html)
+
+        # ════════════════════════════════════════════════════════════════
+        # Health check с проверкой зависимостей
+        # ════════════════════════════════════════════════════════════════
         @app.get("/health")
         @app.get("/healthz")
         async def health():
-            return {"status": "ok", "service": "tg_sup_ai", "version": "1.0.0"}
+            checks = {}
+            all_ok = True
+
+            # 1. Redis
+            if config.REDIS_ENABLED:
+                try:
+                    from redis.asyncio import Redis
+                    r = Redis.from_url(config.REDIS_URL)
+                    await r.ping()
+                    await r.close()
+                    checks["redis"] = {"status": "ok"}
+                except Exception as e:
+                    checks["redis"] = {"status": "error", "detail": str(e)}
+                    all_ok = False
+            else:
+                checks["redis"] = {"status": "disabled"}
+
+            # 2. Sentry
+            if config.SENTRY_ENABLED:
+                checks["sentry"] = {
+                    "status": "ok" if _sentry_initialized else "error",
+                    "initialized": _sentry_initialized,
+                }
+                if not _sentry_initialized:
+                    all_ok = False
+            else:
+                checks["sentry"] = {"status": "disabled"}
+
+            # 3. Директории
+            for d in [config.DOWNLOAD_DIR, config.PROCESSED_DIR]:
+                from pathlib import Path
+                p = Path(d)
+                checks[f"dir_{d}"] = {
+                    "status": "ok" if p.exists() else "error",
+                    "exists": p.exists(),
+                }
+                if not p.exists():
+                    all_ok = False
+
+            # 4. Uptime
+            uptime_sec = _time.time() - _start_time if _start_time else 0
+
+            status_code = 200 if all_ok else 503
+            return JSONResponse(
+                {
+                    "status": "ok" if all_ok else "degraded",
+                    "service": "tg_sup_ai",
+                    "version": "1.0.0",
+                    "uptime_sec": round(uptime_sec, 1),
+                    "checks": checks,
+                },
+                status_code=status_code,
+            )
 
         @app.get("/readyz")
         async def ready():
@@ -160,10 +390,12 @@ async def _start_health_server() -> None:
 
         config_obj = uvicorn.Config(app, host="0.0.0.0", port=config.HEALTH_PORT, log_level="warning")
         _health_server = uvicorn.Server(config_obj)
-        logger.info("🏥 Health-сервер запущен на порту {port}", port=config.HEALTH_PORT)
+        logger.info("🏥 Health-сервер запущен на порту {}", config.HEALTH_PORT)
         await _health_server.serve()
-    except (ImportError, Exception) as e:
-        logger.warning("⚠️ Health-сервер не запущен (fastapi/uvicorn не установлены): {e}")
+    except ImportError:
+        logger.warning("⚠️ Health-сервер не запущен: fastapi/uvicorn не установлены (pip install fastapi uvicorn)")
+    except Exception:
+        logger.exception("⚠️ Health-сервер упал с ошибкой")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -192,8 +424,8 @@ async def _init_redis_storage() -> None:
             )
             logger.info("🗄️ Redis FSM инициализирован: {url}", url=config.REDIS_URL)
         except Exception as e:
-            logger.warning("⚠️ Redis недоступен ({url}), используется in-memory storage: {e}",
-                           url=config.REDIS_URL, e=e)
+            logger.warning("⚠️ Redis недоступен ({}), используется in-memory storage: {}",
+                           config.REDIS_URL, e)
 
 
 # placeholder для yappi stop (заполняется в on_startup)
@@ -202,6 +434,8 @@ _stop_yappi = lambda: None
 
 async def on_startup(bot: Bot):
     """Действия при запуске бота."""
+    global _start_time
+    _start_time = time.time()
     logger.info("=" * 50)
     logger.info("Бот запускается...")
 

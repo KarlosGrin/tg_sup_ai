@@ -2,6 +2,12 @@
 Автоматический профайлер для бота.
 Замеряет время обработки хендлеров, AI-запросов, выполнения кода.
 Логирует всё, что дольше порога. Собирает статистику для /perf.
+
+Prometheus-метрики:
+- bot_files_uploaded_total{ext} — загруженные файлы по расширениям
+- bot_ai_requests_total{provider,status} — AI-запросы (ok/error)
+- bot_code_exec_seconds — гистограмма времени выполнения кода
+- bot_active_users — текущее количество активных пользователей
 """
 
 import hashlib
@@ -14,6 +20,52 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 
 logger = logging.getLogger(__name__)
+
+# ════════════════════════════════════════════════════════════════
+# Prometheus-метрики
+# ════════════════════════════════════════════════════════════════
+
+try:
+    from prometheus_client import Counter, Histogram, Gauge
+
+    files_uploaded = Counter(
+        'bot_files_uploaded_total',
+        'Всего загружено файлов',
+        ['ext'],
+    )
+    ai_requests = Counter(
+        'bot_ai_requests_total',
+        'Запросы к AI провайдеру',
+        ['provider', 'status'],
+    )
+    code_exec_seconds = Histogram(
+        'bot_code_exec_seconds',
+        'Время выполнения кода в песочнице (сек)',
+        buckets=[.1, .5, 1, 2, 5, 10, 30, 60, 120],
+    )
+    active_users = Gauge(
+        'bot_active_users',
+        'Активных пользователей сейчас',
+    )
+    _prometheus_enabled = True
+except ImportError:
+    # fallback: заглушки если prometheus_client не установлен
+    class _CounterStub:
+        def labels(self, **kw): return self
+        def inc(self, n=1): pass
+    class _HistogramStub:
+        def labels(self, **kw): return self
+        def observe(self, n): pass
+    class _GaugeStub:
+        def set(self, n): pass
+        def inc(self, n=1): pass
+        def dec(self, n=1): pass
+
+    files_uploaded = _CounterStub()
+    ai_requests = _CounterStub()
+    code_exec_seconds = _HistogramStub()
+    active_users = _GaugeStub()
+    _prometheus_enabled = False
 
 # ════════════════════════════════════════════════════════════════
 # Хранилище статистики
@@ -68,6 +120,8 @@ class ProfilingMiddleware(BaseMiddleware):
     Middleware, замеряющий время обработки каждого апдейта.
     Логирует всё, что дольше SLOW_THRESHOLD секунд.
     User-ID анонимизируется (sha256[:8]) если LOG_ANONYMIZE_USER_ID=true.
+
+    Prometheus: обновляет active_users на каждом событии.
     """
 
     SLOW_THRESHOLD = 1.0
@@ -79,6 +133,10 @@ class ProfilingMiddleware(BaseMiddleware):
 
         event_type = type(event).__name__
         _record(f"handler.{event_type}", duration)
+
+        # Prometheus: обновляем активных пользователей
+        from handlers.common import user_sessions
+        active_users.set(len(user_sessions))
 
         if duration > self.SLOW_THRESHOLD:
             user_id = None

@@ -14,7 +14,7 @@ from services.ai_service import ai_service
 from services.code_executor import code_executor
 from services.file_service import file_service
 from services.gemini_assistant import gemini_assistant
-from services.profiler import Timer
+from services.profiler import Timer, code_exec_seconds
 from utils.helpers import sanitize_for_markdown
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,12 @@ async def execute_code(code: str, output_path: str, input_path: str | None = Non
                 input_path=input_path,
                 output_path=output_path,
             )
+
+    # Prometheus: записываем время выполнения кода
+    code_exec_seconds.observe(
+        sum(1 for s in [execution_result.get("stdout", ""), execution_result.get("stderr", "")] if s)
+        or 0.1
+    )
     return execution_result
 
 

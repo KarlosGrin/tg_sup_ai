@@ -34,8 +34,11 @@ venv/
 
 # Project-specific ignores
 config.py
-downloads/
 processed/
+*.log
+
+# Логи
+logs/
 *.log
 
 # Профилирование

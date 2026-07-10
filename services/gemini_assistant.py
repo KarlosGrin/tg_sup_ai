@@ -13,10 +13,13 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import re
 import tempfile
 from pathlib import Path
 
+import google.api_core.exceptions as google_exc
+from google import genai
 import tenacity
 
 from config import config
@@ -27,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 def _is_retryable_gemini(exc: BaseException) -> bool:
     """Определяет, можно ли повторить Gemini запрос при этой ошибке."""
-    import google.api_core.exceptions as google_exc
     return isinstance(exc, (
         google_exc.ResourceExhausted,
         google_exc.ServiceUnavailable,
@@ -47,7 +49,6 @@ class GeminiAssistant:
     """
 
     def __init__(self):
-        from google import genai
         self.client = genai.Client(api_key=config.GEMINI_API_KEY)
         self.model = config.GEMINI_MODEL
         self._tmp_files: list[str] = []
@@ -322,7 +323,6 @@ class GeminiAssistant:
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
             tmp_path = tmp.name
             tmp.close()
-            import shutil
             shutil.copy2(str(src.resolve()), tmp_path)
             self._tmp_files.append(tmp_path)
             return tmp_path

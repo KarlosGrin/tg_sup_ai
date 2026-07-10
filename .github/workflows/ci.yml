@@ -157,7 +157,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build sandbox image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.sandbox
@@ -169,7 +169,7 @@ jobs:
 
       # Проверка, что образ не содержит опасных утилит
       - name: Scan sandbox for vulnerable packages (trivy)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@0.21.0
         with:
           image-ref: ${{ env.DOCKER_SANDBOX_IMAGE }}:latest
           format: sarif
